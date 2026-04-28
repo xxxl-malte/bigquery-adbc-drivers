@@ -109,6 +109,18 @@ cd "$REPO_ROOT"
 git worktree add "$WORKTREE_DIR" "$COMMIT_SHA" --detach --quiet
 echo "Worktree created."
 
+# ----- copy test infrastructure into worktree -----
+# The perf/ directory, Dockerfile, and .dockerignore may not exist at the
+# target commit (they were added later). Copy them from the current tree
+# so the worktree can build and run performance tests at any commit.
+WT_CSHARP="$WORKTREE_DIR/csharp"
+echo "Copying test infrastructure into worktree..."
+cp -f "$CSHARP_DIR/Dockerfile" "$WT_CSHARP/Dockerfile"
+cp -f "$CSHARP_DIR/.dockerignore" "$WT_CSHARP/.dockerignore"
+rm -rf "$WT_CSHARP/perf"
+cp -R "$CSHARP_DIR/perf" "$WT_CSHARP/perf"
+echo "  Copied: Dockerfile, .dockerignore, perf/"
+
 # ----- helper: run one perf test -----
 RESULTS_DIR="$(mktemp -d)"
 TEST_NUM=0

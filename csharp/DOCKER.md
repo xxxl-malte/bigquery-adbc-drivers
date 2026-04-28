@@ -96,6 +96,11 @@ in the environment block (or use the `shared` / `$ref:shared.*` pattern — see
 > **Tip:** Run `test/Resources/BigQueryData.sql` against your BigQuery instance first
 > to create the expected test data.
 
+```bash
+ gcloud auth application-default login \
+   --scopes=https://www.googleapis.com/auth/bigquery
+```
+
 ### 2. Set paths in `.env`
 
 ```dotenv
@@ -230,3 +235,60 @@ git worktree remove /tmp/bq-old
 
 > **Tip:** You can have multiple worktrees at the same time (e.g. `/tmp/bq-v1` and
 > `/tmp/bq-v2`) to compare results across commits side by side.
+
+## Stacked Patch Performance Suite
+
+The `patches/` directory contains 10 performance patches (one per documented bottleneck
+in `BOTTLENECKS.md`). The `scripts/run-perf-suite.sh` script applies them incrementally
+and measures the cumulative impact.
+
+### Quick start
+
+```sh
+cd csharp/
+./scripts/run-perf-suite.sh --config ./secrets/perfconfig.json
+```
+
+This will:
+1. Create a git worktree at HEAD
+2. Run a baseline perf test (no patches)
+3. Apply patches 01–10 one at a time, running perf tests after each
+4. Generate `PERFTESTS.md` with a summary table and detailed results
+
+### Options
+
+```
+--config PATH       Path to perfconfig.json (required)
+--commit SHA        Test against a specific commit (default: HEAD)
+--patches DIR       Patch directory (default: ./patches)
+--output PATH       Output file (default: ./PERFTESTS.md)
+--skip-baseline     Skip the baseline run
+--only N            Only run up to patch N
+--env-file PATH     Path to .env file (default: ./.env)
+```
+
+### Running a single commit
+
+To benchmark any arbitrary commit without the patch suite:
+
+```sh
+./scripts/run-perf-at-commit.sh \
+  --config ./secrets/perfconfig.json \
+  --commit abc1234 \
+  --append-to ./PERFTESTS.md
+```
+
+### Patch order
+
+| # | File | Bottleneck |
+|---|------|-----------|
+| 1 | `01-fix-pattern-to-regex.patch` | #7 PatternToRegEx metacharacter escaping |
+| 2 | `02-parameterized-metadata-queries.patch` | #8 Parameterized SQL for metadata |
+| 3 | `03-retry-wallclock-timeout.patch` | #10 Wall-clock retry budget |
+| 4 | `04-persist-detected-project-id.patch` | #3 Persist detected project ID |
+| 5 | `05-skip-credential-recreation.patch` | #4 Skip redundant credential creation |
+| 6 | `06-reuse-grpc-channel.patch` | #5 Avoid gRPC client rebuild |
+| 7 | `07-async-first-execute.patch` | #2 Async-first Execute overrides |
+| 8 | `08-parallel-getobjects.patch` | #6 Parallel GetObjects metadata |
+| 9 | `09-batch-information-schema.patch` | #1 Batch INFORMATION_SCHEMA queries |
+| 10 | `10-reduce-metadata-memory.patch` | #9 Chunked metadata processing |
