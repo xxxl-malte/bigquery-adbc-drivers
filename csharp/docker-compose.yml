@@ -1,0 +1,55 @@
+services:
+  # Build the driver (Release mode)
+  build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: build
+    command: echo "Build complete — driver compiled in Release mode."
+
+  # Run unit tests (no credentials needed)
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    # Override entrypoint args to pass extra flags if needed:
+    #   docker compose run test --filter "FullyQualifiedName~BigQueryConnectionTests"
+
+  # Interactive shell for development / debugging
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: base
+    stdin_open: true
+    tty: true
+    entrypoint: /bin/bash
+    volumes:
+      # Mount source for live editing
+      - ./src:/repo/csharp/src
+      - ./test:/repo/csharp/test
+    environment:
+      - DOTNET_NOLOGO=1
+      - DOTNET_CLI_TELEMETRY_OPTOUT=1
+
+  # Run integration tests (requires BigQuery credentials)
+  integration-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test
+    entrypoint:
+      - dotnet
+      - test
+      - test/AdbcDrivers.BigQuery.Tests.csproj
+      - --no-build
+      - -c
+      - Debug
+      - --logger
+      - console;verbosity=detailed
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/secrets/service-account.json
+    volumes:
+      # Mount your GCP service account key
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-./secrets/service-account.json}:/secrets/service-account.json:ro

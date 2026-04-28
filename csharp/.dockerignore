@@ -1,0 +1,41 @@
+# Build artifacts
+artifacts/
+**/bin/
+**/obj/
+TestResults/
+packages/
+
+# IDE / OS
+.vs/
+.vscode/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+
+# Documentation (keep readmes needed by csproj)
+BOTTLENECKS.md
+
+# Symlink — excluded so Docker doesn't resolve it into real files,
+# which breaks .NET SDK globbing (type conflicts with the referenced assembly).
+# The ProjectReference paths already point directly into arrow-adbc/.
+test/Apache.Arrow.Adbc.Tests
+
+# Submodule: exclude parts not needed for the C# build
+arrow-adbc/.git
+arrow-adbc/c/
+arrow-adbc/ci/
+arrow-adbc/dev/
+arrow-adbc/docker/
+arrow-adbc/docs/
+arrow-adbc/go/
+arrow-adbc/glib/
+arrow-adbc/java/
+arrow-adbc/python/
+arrow-adbc/r/
+arrow-adbc/ruby/
+arrow-adbc/rust/
+arrow-adbc/csharp/Benchmarks/
+arrow-adbc/csharp/test/Drivers/
+arrow-adbc/csharp/test/SmokeTests/
+arrow-adbc/csharp/test/Telemetry/
