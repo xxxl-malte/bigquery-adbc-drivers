@@ -198,3 +198,35 @@ docker compose run --rm perf-test \
 |---|---|
 | `MeasureFullTableImport` | Single run with detailed phase breakdown (connect, query, read) and throughput stats |
 | `MeasureFullTableImportRepeated` | Multiple runs with min/max/avg/stddev statistics |
+
+## Testing an Older Commit
+
+To run tests or benchmarks against a previous version of the code without disturbing
+your working branch, use a [git worktree](https://git-scm.com/docs/git-worktree):
+
+```sh
+# 1. Create a worktree checked out at the target commit
+git worktree add /tmp/bq-old <commit-hash>
+cd /tmp/bq-old
+git submodule update --init --recursive
+
+# 2. Copy the Docker infrastructure into the old tree
+#    (it may not exist at that commit)
+MAIN=~/Projects/bigquery/csharp
+cp "$MAIN"/{Dockerfile,docker-compose.yml,.dockerignore,.env.sample} \
+   /tmp/bq-old/csharp/
+cp "$MAIN"/.env /tmp/bq-old/csharp/ 2>/dev/null   # only if you have one
+cp -r "$MAIN"/perf /tmp/bq-old/csharp/
+
+# 3. Build and run
+cd /tmp/bq-old/csharp
+docker compose build test
+docker compose run --rm test
+
+# 4. Clean up when done
+cd ~/Projects/bigquery
+git worktree remove /tmp/bq-old
+```
+
+> **Tip:** You can have multiple worktrees at the same time (e.g. `/tmp/bq-v1` and
+> `/tmp/bq-v2`) to compare results across commits side by side.
