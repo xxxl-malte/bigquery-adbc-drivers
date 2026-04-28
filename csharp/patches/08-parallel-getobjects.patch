@@ -22,126 +22,64 @@ to a ConcurrentBag. Results are merged back in sorted order at the end.
  csharp/src/BigQueryConnection.cs | 89 +++++++++++++++++++++++---------
  1 file changed, 64 insertions(+), 25 deletions(-)
 
+diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
+index be3377e..ac0a129 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -26,6 +26,7 @@
- using System.Text;
- using System.Text.Json;
- using System.Text.RegularExpressions;
+@@ -22,6 +22,7 @@
+ */
+ 
+ using System;
 +using System.Collections.Concurrent;
- using System.Threading.Tasks;
- using Apache.Arrow;
-
-@@ -779,14 +780,33 @@
+ using System.Collections.Generic;
+ using System.Diagnostics;
+ using System.Linq;
+@@ -817,22 +818,38 @@ namespace AdbcDrivers.BigQuery
+ 
+                 projectIds.Sort();
+ 
++                // Filter matching project IDs first
 +                List<string> matchingProjectIds = new List<string>();
-+
                  foreach (string projectId in projectIds)
                  {
                      if (Regex.IsMatch(projectId, catalogRegexp, RegexOptions.IgnoreCase))
-                     {
--                        catalogNameBuilder.Append(projectId);
--
-                         if (depth == GetObjectsDepth.Catalogs)
-                         {
-+                            catalogNameBuilder.Append(projectId);
-                             catalogDbSchemasValues.Add(null);
-                         }
-                         else
-                         {
--                            catalogDbSchemasValues.Add(GetDbSchemas(
--                                depth, projectId, dbSchemaPattern,
--                                tableNamePattern, tableTypes, columnNamePattern));
-+                            matchingProjectIds.Add(projectId);
-+                        }
++                    {
++                        matchingProjectIds.Add(projectId);
 +                    }
 +                }
 +
-+                // Parallel fetch schemas for all matching projects
-+                if (matchingProjectIds.Count > 0)
++                if (depth == GetObjectsDepth.Catalogs)
 +                {
-+                    var results = new ConcurrentDictionary<string, StructArray>();
-+                    Parallel.ForEach(matchingProjectIds, projectId =>
++                    foreach (string projectId in matchingProjectIds)
+                     {
+                         catalogNameBuilder.Append(projectId);
++                        catalogDbSchemasValues.Add(null);
++                    }
++                }
++                else
++                {
++                    var schemaResults = new ConcurrentDictionary<string, StructArray>();
++                    System.Threading.Tasks.Parallel.ForEach(matchingProjectIds, projectId =>
 +                    {
-+                        results[projectId] = GetDbSchemas(
++                        schemaResults[projectId] = GetDbSchemas(
 +                            depth, projectId, dbSchemaPattern,
 +                            tableNamePattern, tableTypes, columnNamePattern);
 +                    });
-+
-+                    // Merge results in sorted order
+ 
+-                        if (depth == GetObjectsDepth.Catalogs)
+-                        {
+-                            catalogDbSchemasValues.Add(null);
+-                        }
+-                        else
+-                        {
+-                            catalogDbSchemasValues.Add(GetDbSchemas(
+-                                depth, projectId, dbSchemaPattern,
+-                                tableNamePattern, tableTypes, columnNamePattern));
+-                        }
 +                    foreach (string projectId in matchingProjectIds)
 +                    {
 +                        catalogNameBuilder.Append(projectId);
-+                        if (results.TryGetValue(projectId, out var schemas))
-+                        {
-+                            catalogDbSchemasValues.Add(schemas);
-+                        }
-+                        else
-+                        {
-+                            catalogDbSchemasValues.Add(null);
-                         }
++                        catalogDbSchemasValues.Add(schemaResults[projectId]);
                      }
                  }
  
-@@ -921,6 +939,8 @@
-                 if (result != null)
-                 {
-+                    // Collect table info first, then fetch details in parallel
-+                    var tableInfos = new List<(string Name, string Type)>();
-                     foreach (BigQueryRow row in result)
-                     {
--                        tableNameBuilder.Append(GetValue(row["table_name"]));
--                        tableTypeBuilder.Append(GetValue(row["table_type"]));
--                        nullBitmapBuffer.Append(true);
--                        length++;
-+                        tableInfos.Add((GetValue(row["table_name"]), GetValue(row["table_type"])));
-+                    }
- 
--                        if (depth == GetObjectsDepth.All && includeConstraints)
--                        {
--                            tableConstraintsValues.Add(GetConstraintSchema(
--                                depth, catalog, dbSchema, GetValue(row["table_name"]), columnNamePattern));
--                        }
--                        else
--                        {
--                            tableConstraintsValues.Add(null);
--                        }
-+                    // Parallel fetch column/constraint schemas
-+                    var columnResults = new StructArray?[tableInfos.Count];
-+                    var constraintResults = new StructArray?[tableInfos.Count];
- 
--                        if (depth == GetObjectsDepth.Tables)
--                    if (depth != GetObjectsDepth.Tables || (depth == GetObjectsDepth.All && includeConstraints))
-+                    if (depth != GetObjectsDepth.Tables)
-+                    {
-+                        Parallel.For(0, tableInfos.Count, i =>
-                         {
--                            tableColumnsValues.Add(null);
--                        }
--                        else
--                        {
--                            tableColumnsValues.Add(GetColumnSchema(catalog, dbSchema, GetValue(row["table_name"]), columnNamePattern));
--                        }
-+                            string tableName = tableInfos[i].Name;
-+
-+                            if (depth != GetObjectsDepth.Tables)
-+                            {
-+                                columnResults[i] = GetColumnSchema(catalog, dbSchema, tableName, columnNamePattern);
-+                            }
-+
-+                            if (depth == GetObjectsDepth.All && includeConstraints)
-+                            {
-+                                constraintResults[i] = GetConstraintSchema(depth, catalog, dbSchema, tableName, columnNamePattern);
-+                            }
-+                        });
-+                    }
-+
-+                    for (int i = 0; i < tableInfos.Count; i++)
-+                    {
-+                        tableNameBuilder.Append(tableInfos[i].Name);
-+                        tableTypeBuilder.Append(tableInfos[i].Type);
-+                        nullBitmapBuffer.Append(true);
-+                        length++;
-+                        tableColumnsValues.Add(columnResults[i]);
-+                        tableConstraintsValues.Add(constraintResults[i]);
-                     }
-                 }

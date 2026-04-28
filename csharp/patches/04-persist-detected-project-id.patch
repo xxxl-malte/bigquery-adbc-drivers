@@ -20,48 +20,46 @@ Open() directly, preserving the project ID across credential refreshes.
  csharp/src/BigQueryStatement.cs  | 3 +++
  2 files changed, 9 insertions(+), 1 deletion(-)
 
+diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
+index d62962f..6179fb2 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -685,8 +685,13 @@
-         /// Renews the internal BigQueryClient with updated credentials.
+@@ -686,8 +686,11 @@ namespace AdbcDrivers.BigQuery
          /// </summary>
          internal void UpdateClientToken()
          {
 -            // there isn't a way to set the credentials, just need to open a new client
 -            Client = Open();
-+            // Preserve the current project ID across credential refreshes so we don't
-+            // re-detect it via an expensive ListProjects API call.
++            // Preserve the detected project ID across credential refreshes
 +            string? currentProjectId = Client?.ProjectId;
 +            if (string.IsNullOrEmpty(currentProjectId) || currentProjectId == BigQueryConstants.DetectProjectId)
 +                currentProjectId = null; // let Open() resolve it from properties
-+
 +            Client = Open(currentProjectId);
          }
-
---- a/csharp/src/BigQueryConnection.cs  (additional hunk)
-+++ b/csharp/src/BigQueryConnection.cs
-@@ -696,6 +701,14 @@
+ 
+         /// <summary>
+@@ -695,6 +698,11 @@ namespace AdbcDrivers.BigQuery
+         /// </summary>
          public bool TokenRequiresUpdate(Exception ex) => BigQueryUtils.TokenRequiresUpdate(ex);
  
-+        /// <summary>
-+        /// Stores a detected or resolved property value for reuse across client rebuilds.
-+        /// </summary>
 +        internal void PersistProperty(string key, string value)
 +        {
 +            this.properties[key] = value;
 +        }
 +
-
+         internal int RetryTotalTimeoutMs { get; private set; } = 0;
+ 
+         private async Task<T> ExecuteWithRetriesAsync<T>(Func<Task<T>> action, Activity? activity) => await RetryManager.ExecuteWithRetriesAsync<T>(this, action, activity, MaxRetryAttempts, RetryDelayMs, RetryTotalTimeoutMs);
+diff --git a/csharp/src/BigQueryStatement.cs b/csharp/src/BigQueryStatement.cs
+index 7954aef..b3486b2 100644
 --- a/csharp/src/BigQueryStatement.cs
 +++ b/csharp/src/BigQueryStatement.cs
-@@ -938,6 +938,9 @@
-                     if (firstProjectId != null)
+@@ -937,6 +937,8 @@ namespace AdbcDrivers.BigQuery
                      {
                          options.ProjectId = firstProjectId;
                          activity?.AddBigQueryTag("detected_client_project_id", firstProjectId);
-+                        // Persist so subsequent Open()/UpdateClientToken() calls don't re-detect
++                        // Persist the detected project ID so UpdateClientToken can reuse it
 +                        this.bigQueryConnection.PersistProperty(BigQueryParameters.ProjectId, firstProjectId);
-+
                          // need to reopen the Client with the projectId specified
                          this.bigQueryConnection.Open(firstProjectId);
                      }

@@ -25,9 +25,12 @@ credential truly changes. However, this patch improves the situation:
  csharp/src/TokenProtectedReadClient.cs | 22 ++++++++++++++++------
  1 file changed, 16 insertions(+), 6 deletions(-)
 
+diff --git a/csharp/src/TokenProtectedReadClient.cs b/csharp/src/TokenProtectedReadClient.cs
+index 0eb2e79..6ae9502 100644
 --- a/csharp/src/TokenProtectedReadClient.cs
 +++ b/csharp/src/TokenProtectedReadClient.cs
-@@ -33,6 +34,7 @@
+@@ -33,7 +33,9 @@ namespace AdbcDrivers.BigQuery
+     /// </summary>
      internal class TokenProtectedReadClientManger : ITokenProtectedResource
      {
 -        BigQueryReadClient bigQueryReadClient;
@@ -37,11 +40,7 @@ credential truly changes. However, this patch improves the situation:
  
          public TokenProtectedReadClientManger(GoogleCredential credential)
          {
-@@ -50,12 +53,22 @@
-         public void UpdateCredential(GoogleCredential? credential)
-         {
-             if (credential == null)
-             {
+@@ -54,9 +56,16 @@ namespace AdbcDrivers.BigQuery
                  throw new ArgumentNullException(nameof(credential));
              }
  
@@ -50,14 +49,11 @@ credential truly changes. However, this patch improves the situation:
 -            this.bigQueryReadClient = readClientBuilder.Build();
 +            lock (_rebuildLock)
 +            {
-+                // Skip rebuild if called with the exact same credential object
 +                if (ReferenceEquals(credential, _lastCredential) && bigQueryReadClient != null)
 +                    return;
 +
-+                BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder
-+                {
-+                    Credential = credential
-+                };
++                BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder();
++                readClientBuilder.Credential = credential;
 +                this.bigQueryReadClient = readClientBuilder.Build();
 +                _lastCredential = credential;
 +            }

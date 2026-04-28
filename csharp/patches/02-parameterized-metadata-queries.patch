@@ -17,9 +17,12 @@ WHERE clause filter values now use BigQueryParameter.
  csharp/src/BigQueryConnection.cs | 50 ++++++++++++++++++++++---------
  1 file changed, 35 insertions(+), 15 deletions(-)
 
+diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
+index abeef1a..c9e4f22 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -888,25 +888,29 @@
+@@ -888,28 +888,35 @@ namespace AdbcDrivers.BigQuery
+                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                  int length = 0;
  
 -                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.TABLES",
@@ -36,9 +39,11 @@ WHERE clause filter values now use BigQueryParameter.
                      {
 -                        IEnumerable<string> sanitizedTypes = tableTypes.Select(x => Sanitize(x));
 -                        query = string.Concat(query, string.Format(" AND table_type IN ('{0}')", string.Join("', '", sanitizedTypes).ToUpper()));
-+                        IEnumerable<string> upperTypes = tableTypes.Select(x => x.ToUpper());
-+                        query += $" AND UPPER(table_type) IN UNNEST(@tableTypes)";
-+                        queryParams.Add(new BigQueryParameter("tableTypes", BigQueryDbType.Array) { ArrayType = BigQueryDbType.String, Value = upperTypes.ToArray() });
++                        List<string> upperTypes = tableTypes.Select(x => x.ToUpper()).ToList();
++                        string typePlaceholders = string.Join(", ", upperTypes.Select((_, idx) => $"@tableType{idx}"));
++                        query += $" AND UPPER(table_type) IN ({typePlaceholders})";
++                        for (int idx = 0; idx < upperTypes.Count; idx++)
++                            queryParams.Add(new BigQueryParameter($"tableType{idx}", BigQueryDbType.String, upperTypes[idx]));
                      }
                  }
                  else
@@ -47,16 +52,21 @@ WHERE clause filter values now use BigQueryParameter.
                      {
 -                        IEnumerable<string> sanitizedTypes = tableTypes.Select(x => Sanitize(x));
 -                        query = string.Concat(query, string.Format(" WHERE table_type IN ('{0}')", string.Join("', '", sanitizedTypes).ToUpper()));
-+                        IEnumerable<string> upperTypes = tableTypes.Select(x => x.ToUpper());
-+                        query += $" WHERE UPPER(table_type) IN UNNEST(@tableTypes)";
-+                        queryParams.Add(new BigQueryParameter("tableTypes", BigQueryDbType.Array) { ArrayType = BigQueryDbType.String, Value = upperTypes.ToArray() });
++                        List<string> upperTypes = tableTypes.Select(x => x.ToUpper()).ToList();
++                        string typePlaceholders = string.Join(", ", upperTypes.Select((_, idx) => $"@tableType{idx}"));
++                        query += $" WHERE UPPER(table_type) IN ({typePlaceholders})";
++                        for (int idx = 0; idx < upperTypes.Count; idx++)
++                            queryParams.Add(new BigQueryParameter($"tableType{idx}", BigQueryDbType.String, upperTypes[idx]));
                      }
                  }
  
 -                BigQueryResults? result = ExecuteQuery(query, parameters: null);
 +                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams.Count > 0 ? queryParams : null);
  
-@@ -995,13 +999,15 @@
+                 if (result != null)
+                 {
+@@ -995,15 +1002,17 @@ namespace AdbcDrivers.BigQuery
+                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                  int length = 0;
  
 -                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = '{2}'",
@@ -75,7 +85,10 @@ WHERE clause filter values now use BigQueryParameter.
 -                BigQueryResults? result = ExecuteQuery(query, parameters: null);
 +                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
  
-@@ -1097,10 +1103,12 @@
+                 if (result != null)
+                 {
+@@ -1097,10 +1106,11 @@ namespace AdbcDrivers.BigQuery
+                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                  int length = 0;
  
 -                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE table_name = '{2}'",
@@ -87,7 +100,9 @@ WHERE clause filter values now use BigQueryParameter.
 -                BigQueryResults? result = ExecuteQuery(query, parameters: null);
 +                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
  
-@@ -1161,10 +1169,15 @@
+                 if (result != null)
+                 {
+@@ -1161,12 +1171,14 @@ namespace AdbcDrivers.BigQuery
          {
              return this.TraceActivity(activity =>
              {
@@ -103,7 +118,10 @@ WHERE clause filter values now use BigQueryParameter.
 -                BigQueryResults? result = ExecuteQuery(query, parameters: null);
 +                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
  
-@@ -1196,10 +1209,12 @@
+                 if (result != null)
+                 {
+@@ -1196,10 +1208,11 @@ namespace AdbcDrivers.BigQuery
+                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                  int length = 0;
  
 -                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE WHERE constraint_name = '{2}'",
@@ -114,3 +132,6 @@ WHERE clause filter values now use BigQueryParameter.
  
 -                BigQueryResults? result = ExecuteQuery(query, parameters: null);
 +                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
+ 
+                 if (result != null)
+                 {

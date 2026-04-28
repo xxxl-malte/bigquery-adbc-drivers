@@ -26,90 +26,71 @@ Apache Arrow ADBC interface and is tracked separately.
  csharp/src/BigQueryParameters.cs |  3 +++
  2 files changed, 46 insertions(+), 2 deletions(-)
 
---- a/csharp/src/BigQueryParameters.cs
-+++ b/csharp/src/BigQueryParameters.cs
-@@ -63,6 +63,9 @@
-         /// </summary>
-         public const string CreateLargeResultsDataset = "adbc.bigquery.create_large_results_dataset";
- 
-+        /// <summary>
-+        /// Controls the batch size for metadata operations (number of datasets processed at a time).
-+        /// Lower values reduce peak memory usage; higher values reduce round-trips. Default: 50.
-+        /// </summary>
-+        public const string MetadataBatchSize = "adbc.bigquery.metadata_batch_size";
-+
-
+diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
+index 37f0cc8..68e05a3 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -810,6 +810,15 @@
-             return this.TraceActivity(activity =>
-             {
-+                // Configurable batch size for metadata operations
+@@ -890,13 +890,33 @@ namespace AdbcDrivers.BigQuery
+ 
+                 PagedEnumerable<DatasetList, BigQueryDataset>? schemas = ExecuteWithRetriesAsync<PagedEnumerable<DatasetList, BigQueryDataset>?>(func, activity).GetAwaiter().GetResult();
+ 
++                // Parse configurable batch size for metadata operations
 +                int metadataBatchSize = 50;
-+                if (this.properties.TryGetValue(BigQueryParameters.MetadataBatchSize, out string? batchSizeStr))
++                if (this.properties.TryGetValue(BigQueryParameters.MetadataBatchSize, out string? batchSizeStr)
++                    && int.TryParse(batchSizeStr, out int parsedBatchSize) && parsedBatchSize > 0)
 +                {
-+                    if (int.TryParse(batchSizeStr, out int parsed) && parsed > 0)
-+                    {
-+                        metadataBatchSize = parsed;
-+                    }
++                    metadataBatchSize = parsedBatchSize;
 +                }
 +
-                 StringArray.Builder dbSchemaNameBuilder = new StringArray.Builder();
-                 List<IArrowArray?> dbSchemaTablesValues = new List<IArrowArray?>();
-                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
-@@ -835,6 +844,9 @@
- 
                  if (schemas != null)
                  {
-+                    // Collect matching schemas first, then process in batches
-+                    var matchingSchemas = new List<string>();
-+
++                    List<string> matchingSchemas = new List<string>();
                      foreach (BigQueryDataset schema in schemas)
                      {
                          if (Regex.IsMatch(schema.Reference.DatasetId, dbSchemaRegexp, RegexOptions.IgnoreCase))
                          {
 -                            dbSchemaNameBuilder.Append(schema.Reference.DatasetId);
--                            length++;
--                            nullBitmapBuffer.Append(true);
--
-                             if (depth == GetObjectsDepth.DbSchemas)
-                             {
-+                                dbSchemaNameBuilder.Append(schema.Reference.DatasetId);
-+                                length++;
-+                                nullBitmapBuffer.Append(true);
-                                 dbSchemaTablesValues.Add(null);
-                             }
-                             else
-                             {
--                                dbSchemaTablesValues.Add(GetTableSchemas(
--                                    depth, catalog, schema.Reference.DatasetId,
--                                    tableNamePattern, tableTypes, columnNamePattern));
-+                                matchingSchemas.Add(schema.Reference.DatasetId);
-                             }
-                         }
-                     }
++                            matchingSchemas.Add(schema.Reference.DatasetId);
++                        }
++                    }
 +
-+                    // Process in batches to limit peak memory
 +                    for (int batchStart = 0; batchStart < matchingSchemas.Count; batchStart += metadataBatchSize)
 +                    {
 +                        int batchEnd = Math.Min(batchStart + metadataBatchSize, matchingSchemas.Count);
 +
 +                        for (int i = batchStart; i < batchEnd; i++)
 +                        {
-+                            string datasetId = matchingSchemas[i];
-+                            dbSchemaNameBuilder.Append(datasetId);
-+                            length++;
-+                            nullBitmapBuffer.Append(true);
++                            string schemaId = matchingSchemas[i];
++                            dbSchemaNameBuilder.Append(schemaId);
+                             length++;
+                             nullBitmapBuffer.Append(true);
+ 
+@@ -907,10 +927,15 @@ namespace AdbcDrivers.BigQuery
+                             else
+                             {
+                                 dbSchemaTablesValues.Add(GetTableSchemas(
+-                                    depth, catalog, schema.Reference.DatasetId,
++                                    depth, catalog, schemaId,
+                                     tableNamePattern, tableTypes, columnNamePattern));
+                             }
+                         }
 +
-+                            dbSchemaTablesValues.Add(GetTableSchemas(
-+                                depth, catalog, datasetId,
-+                                tableNamePattern, tableTypes, columnNamePattern));
-+                        }
-+
-+                        // Hint GC to collect intermediate objects between batches
 +                        if (batchEnd < matchingSchemas.Count)
 +                        {
 +                            GC.Collect(0, GCCollectionMode.Optimized, false);
 +                        }
-+                    }
+                     }
                  }
+ 
+diff --git a/csharp/src/BigQueryParameters.cs b/csharp/src/BigQueryParameters.cs
+index e1b9704..370cfde 100644
+--- a/csharp/src/BigQueryParameters.cs
++++ b/csharp/src/BigQueryParameters.cs
+@@ -57,6 +57,7 @@ namespace AdbcDrivers.BigQuery
+         public const string RefreshToken = "adbc.bigquery.refresh_token";
+         public const string RetryDelayMs = "adbc.bigquery.retry_delay_ms";
+         public const string RetryTotalTimeoutMs = "adbc.bigquery.retry_total_timeout_ms";
++        public const string MetadataBatchSize = "adbc.bigquery.metadata_batch_size";
+         public const string Scopes = "adbc.bigquery.scopes";
+         public const string StatementIndex = "adbc.bigquery.multiple_statement.statement_index";
+         public const string StatementType = "adbc.bigquery.multiple_statement.statement_type";

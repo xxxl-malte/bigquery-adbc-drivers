@@ -13,25 +13,22 @@ SQL LIKE wildcards (now escaped as \_ and \%) with their regex equivalents.
  csharp/src/BigQueryConnection.cs | 7 +++++--
  1 file changed, 5 insertions(+), 2 deletions(-)
 
+diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
+index bfc6fa5..abeef1a 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -1240,11 +1240,14 @@
-         private string PatternToRegEx(string? pattern)
-         {
+@@ -1242,8 +1242,13 @@ namespace AdbcDrivers.BigQuery
              if (pattern == null)
                  return ".*";
  
--            StringBuilder builder = new StringBuilder("(?i)^");
--            string convertedPattern = pattern.Replace("_", ".").Replace("%", ".*");
 +            // Escape regex metacharacters first (e.g. . * + ? become \. \* \+ \?),
 +            // then convert SQL LIKE wildcards to regex equivalents.
 +            // Regex.Escape does NOT escape _ or % (they aren't regex metacharacters),
 +            // so we replace them directly after escaping everything else.
 +            string escaped = Regex.Escape(pattern);
-+            StringBuilder builder = new StringBuilder("(?i)^");
+             StringBuilder builder = new StringBuilder("(?i)^");
+-            string convertedPattern = pattern.Replace("_", ".").Replace("%", ".*");
 +            string convertedPattern = escaped.Replace("_", ".").Replace("%", ".*");
              builder.Append(convertedPattern);
              builder.Append("$");
  
-             return builder.ToString();
-         }

@@ -20,6 +20,7 @@
 #   --skip-baseline     Skip the baseline (no-patches) run
 #   --only N            Only run up to patch N (0 = baseline only)
 #   --env-file PATH     Path to .env file for Docker (default: ./.env)
+#   --image NAME        Docker SDK image (default: mcr.microsoft.com/dotnet/sdk:8.0)
 #   --help              Show this help message
 #
 set -euo pipefail
@@ -36,6 +37,7 @@ OUTPUT_FILE="$CSHARP_DIR/PERFTESTS.md"
 SKIP_BASELINE=false
 ONLY_UPTO=-1  # -1 means all
 ENV_FILE="$CSHARP_DIR/.env"
+DOCKER_IMAGE="mcr.microsoft.com/dotnet/sdk:8.0"
 
 # ----- parse args -----
 while [[ $# -gt 0 ]]; do
@@ -47,8 +49,9 @@ while [[ $# -gt 0 ]]; do
         --skip-baseline) SKIP_BASELINE=true; shift ;;
         --only)       ONLY_UPTO="$2"; shift 2 ;;
         --env-file)   ENV_FILE="$2"; shift 2 ;;
+        --image)      DOCKER_IMAGE="$2"; shift 2 ;;
         --help)
-            head -28 "$0" | tail -22
+            head -30 "$0" | tail -24
             exit 0
             ;;
         *)
@@ -91,9 +94,12 @@ COMMIT_SHA="$(cd "$REPO_ROOT" && git rev-parse "$COMMIT")"
 COMMIT_SHORT="${COMMIT_SHA:0:8}"
 echo "Testing against commit: $COMMIT_SHA"
 
+# ----- pull Docker image -----
+echo "Pulling Docker image: $DOCKER_IMAGE ..."
+docker pull "$DOCKER_IMAGE" --quiet >/dev/null 2>&1 || true
+
 # ----- create worktree -----
 WORKTREE_DIR="$(mktemp -d)"
-WORKTREE_NAME="perf-test-$$"
 echo "Creating worktree at $WORKTREE_DIR ..."
 
 cleanup() {
@@ -109,21 +115,36 @@ cd "$REPO_ROOT"
 git worktree add "$WORKTREE_DIR" "$COMMIT_SHA" --detach --quiet
 echo "Worktree created."
 
-# ----- copy test infrastructure into worktree -----
-# The perf/ directory, Dockerfile, and .dockerignore may not exist at the
-# target commit (they were added later). Copy them from the current tree
-# so the worktree can build and run performance tests at any commit.
+# ----- initialize submodule in worktree -----
+# Git worktrees don't auto-init submodules; the csharp/arrow-adbc
+# directory will be empty. We copy it from the main tree to avoid
+# a slow re-clone from GitHub.
 WT_CSHARP="$WORKTREE_DIR/csharp"
+MAIN_SUBMODULE="$CSHARP_DIR/arrow-adbc"
+
+if [[ -d "$MAIN_SUBMODULE/.git" ]] || [[ -f "$MAIN_SUBMODULE/.git" ]]; then
+    echo "Copying submodule arrow-adbc into worktree..."
+    rm -rf "$WT_CSHARP/arrow-adbc"
+    cp -R "$MAIN_SUBMODULE" "$WT_CSHARP/arrow-adbc"
+    echo "  Submodule copied."
+else
+    echo "Initializing submodule in worktree (may take a minute)..."
+    cd "$WORKTREE_DIR"
+    git submodule update --init --recursive
+    echo "  Submodule initialized."
+fi
+
+# ----- copy test infrastructure into worktree -----
+# The perf/ directory may not exist at the target commit (it was added
+# later). Copy it from the current tree so the worktree can run
+# performance tests at any commit.
 echo "Copying test infrastructure into worktree..."
-cp -f "$CSHARP_DIR/Dockerfile" "$WT_CSHARP/Dockerfile"
-cp -f "$CSHARP_DIR/.dockerignore" "$WT_CSHARP/.dockerignore"
 rm -rf "$WT_CSHARP/perf"
 cp -R "$CSHARP_DIR/perf" "$WT_CSHARP/perf"
-echo "  Copied: Dockerfile, .dockerignore, perf/"
+echo "  Copied: perf/"
 
 # ----- helper: run one perf test -----
 RESULTS_DIR="$(mktemp -d)"
-TEST_NUM=0
 
 run_perf_test() {
     local label="$1"
@@ -135,19 +156,23 @@ run_perf_test() {
     echo "=========================================="
 
     local wt_csharp="$WORKTREE_DIR/csharp"
+    local output_file="$RESULTS_DIR/${test_id}_output.txt"
+    local build_log="$RESULTS_DIR/${test_id}_build.log"
 
-    # Build the perf test image
-    echo "  Building Docker image..."
-    if ! docker build \
-        --target perf \
-        -t "bq-perf-$test_id" \
-        -f "$wt_csharp/Dockerfile" \
-        "$wt_csharp" \
-        --quiet 2>"$RESULTS_DIR/${test_id}_build.log"; then
+    # Restore + build inside Docker via volume mount
+    echo "  Restoring & building..."
+    if ! docker run --rm \
+        -v "$wt_csharp:/repo/csharp" \
+        -w /repo/csharp \
+        "$DOCKER_IMAGE" \
+        sh -c "dotnet build perf/AdbcDrivers.BigQuery.Perf.csproj -c Release" \
+        > "$build_log" 2>&1; then
 
         echo "  ❌ Build FAILED for $label"
         echo "BUILD_FAILED" > "$RESULTS_DIR/${test_id}_status"
-        cat "$RESULTS_DIR/${test_id}_build.log"
+        echo "0" > "$RESULTS_DIR/${test_id}_wallclock"
+        echo ""
+        tail -20 "$build_log"
         return 1
     fi
 
@@ -160,17 +185,18 @@ run_perf_test() {
     fi
 
     # Run the perf test
-    local output_file="$RESULTS_DIR/${test_id}_output.txt"
     local start_time end_time
-
     start_time=$(date +%s)
 
     if docker run --rm \
-        "${env_args[@]}" \
-        -e "BIGQUERY_PERF_CONFIG_FILE=/app/perfconfig.json" \
-        -v "$CONFIG_FILE:/app/perfconfig.json:ro" \
-        "bq-perf-$test_id" \
-        dotnet test /app/perf/ \
+        ${env_args[@]+"${env_args[@]}"} \
+        -e "BIGQUERY_PERF_CONFIG_FILE=/repo/perfconfig.json" \
+        -v "$wt_csharp:/repo/csharp" \
+        -v "$CONFIG_FILE:/repo/perfconfig.json:ro" \
+        -w /repo/csharp \
+        "$DOCKER_IMAGE" \
+        dotnet test perf/AdbcDrivers.BigQuery.Perf.csproj \
+            -c Release \
             --no-build \
             --logger "console;verbosity=detailed" \
             --filter "FullyQualifiedName~MeasureFullTableImport" \
@@ -186,9 +212,6 @@ run_perf_test() {
     fi
 
     echo "$((end_time - start_time))" > "$RESULTS_DIR/${test_id}_wallclock"
-
-    # Clean up docker image
-    docker rmi "bq-perf-$test_id" --quiet 2>/dev/null || true
 }
 
 # ----- extract metrics from test output -----
@@ -316,7 +339,7 @@ echo "=========================================="
     if [[ "$SKIP_BASELINE" == false ]] && [[ -f "$RESULTS_DIR/baseline_output.txt" ]]; then
         echo "### Baseline (no patches)"
         echo ""
-        echo "**Wall-clock time:** $(cat "$RESULTS_DIR/baseline_wallclock" 2>/dev/null || echo "N/A")s (including Docker build)"
+        echo "**Wall-clock time:** $(cat "$RESULTS_DIR/baseline_wallclock" 2>/dev/null || echo "N/A")s"
         echo ""
         echo "<details>"
         echo "<summary>Full test output</summary>"
