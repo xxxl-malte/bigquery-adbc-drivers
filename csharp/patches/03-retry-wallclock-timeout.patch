@@ -1,0 +1,122 @@
+From: Performance Patch Series
+Subject: [PATCH 03/10] Add wall-clock timeout to RetryManager
+
+Bottleneck #10: RetryManager is bounded only by attempt count (5 retries
+= 6 attempts), with exponential backoff from 200ms to 5000ms cap. There
+is no total wall-clock timeout, so if each operation itself is slow, the
+total elapsed time can be unbounded.
+
+This patch:
+1. Adds a totalTimeoutMilliseconds parameter to RetryManager
+2. Adds a new ADBC parameter adbc.bigquery.retry_total_timeout_ms
+3. Adds a RetryTotalTimeoutMs property to BigQueryConnection (default 0 = no limit)
+4. Wires the timeout through the wrapper methods in both Connection and Statement
+
+When set to a positive value, the retry loop checks elapsed time before
+each attempt and aborts if the deadline would be exceeded. The default
+(0) preserves existing behavior.
+
+---
+ csharp/src/RetryManager.cs       | 24 ++++++++++++++++++------
+ csharp/src/BigQueryParameters.cs |  1 +
+ csharp/src/BigQueryConnection.cs | 18 ++++++++++++++++--
+ csharp/src/BigQueryStatement.cs  |  4 +++-
+ 4 files changed, 38 insertions(+), 9 deletions(-)
+
+--- a/csharp/src/RetryManager.cs
++++ b/csharp/src/RetryManager.cs
+@@ -38,12 +38,15 @@
+         public static async Task<T> ExecuteWithRetriesAsync<T>(
+             ITokenProtectedResource tokenProtectedResource,
+             Func<Task<T>> action,
+             Activity? activity,
+             int maxRetries = 5,
+             int initialDelayMilliseconds = 200,
++            int totalTimeoutMilliseconds = 0,
+             CancellationToken cancellationToken = default)
+         {
+             if (action == null)
+             {
+                 throw new AdbcException("There is no method to retry", AdbcStatusCode.InvalidArgument);
+             }
+ 
+             int attempt = 0;
+             int tokenRefreshAttempts = 0;
+             int maxAttempts = maxRetries + 1; // maxRetries=0 means 1 attempt, maxRetries=5 means 6 attempts
+             int delay = initialDelayMilliseconds;
++            Stopwatch totalTimer = Stopwatch.StartNew();
++            bool hasWallClockLimit = totalTimeoutMilliseconds > 0;
+ 
+             while (attempt < maxAttempts)
+             {
++                // Check wall-clock budget before each attempt (except the first)
++                if (hasWallClockLimit && attempt > 0 && totalTimer.ElapsedMilliseconds >= totalTimeoutMilliseconds)
++                {
++                    activity?.AddBigQueryTag("retry.timeout", "wall_clock_exceeded");
++                    throw new AdbcException(
++                        $"Operation timed out after {totalTimer.ElapsedMilliseconds}ms ({attempt} attempt(s)). Wall-clock limit: {totalTimeoutMilliseconds}ms.",
++                        AdbcStatusCode.Timeout);
++                }
++
+                 try
+                 {
+                     T result = await action();
+                     return result;
+                 }
+@@ -110,7 +123,12 @@
+                     }
+ 
+-                    await Task.Delay(delay, cancellationToken);
++                    // If the delay would push us past the wall-clock limit, clamp it
++                    if (hasWallClockLimit)
++                    {
++                        long remaining = totalTimeoutMilliseconds - totalTimer.ElapsedMilliseconds;
++                        if (remaining <= 0) continue; // will hit the timeout check at top of loop
++                        delay = (int)Math.Min(delay, remaining);
++                    }
++
++                    await Task.Delay(delay, cancellationToken);
+                     delay = Math.Min(2 * delay, 5000);
+                 }
+             }
+
+--- a/csharp/src/BigQueryParameters.cs
++++ b/csharp/src/BigQueryParameters.cs
+@@ -58,6 +58,7 @@
+         public const string RetryDelayMs = "adbc.bigquery.retry_delay_ms";
++        public const string RetryTotalTimeoutMs = "adbc.bigquery.retry_total_timeout_ms";
+
+--- a/csharp/src/BigQueryConnection.cs
++++ b/csharp/src/BigQueryConnection.cs
+@@ -184,6 +184,8 @@
+         internal int RetryDelayMs { get; private set; } = 200;
+ 
++        internal int RetryTotalTimeoutMs { get; private set; } = 0;
++
+@@ -126,6 +128,16 @@
++            if (this.properties.TryGetValue(BigQueryParameters.RetryTotalTimeoutMs, out string? sRetryTimeout) &&
++                int.TryParse(sRetryTimeout, out int retryTimeout) && retryTimeout >= 0)
++            {
++                RetryTotalTimeoutMs = retryTimeout;
++            }
++            else if (sRetryTimeout != null)
++            {
++                throw new ArgumentException($"The value '{sRetryTimeout}' for parameter '{BigQueryParameters.RetryTotalTimeoutMs}' is not a valid non-negative integer.");
++            }
++
+@@ -698,7 +710,7 @@
+-        private async Task<T> ExecuteWithRetriesAsync<T>(Func<Task<T>> action, Activity? activity) => await RetryManager.ExecuteWithRetriesAsync<T>(this, action, activity, MaxRetryAttempts, RetryDelayMs);
++        private async Task<T> ExecuteWithRetriesAsync<T>(Func<Task<T>> action, Activity? activity) => await RetryManager.ExecuteWithRetriesAsync<T>(this, action, activity, MaxRetryAttempts, RetryDelayMs, RetryTotalTimeoutMs);
+
+--- a/csharp/src/BigQueryStatement.cs
++++ b/csharp/src/BigQueryStatement.cs
+@@ -84,6 +84,8 @@
+         private int RetryDelayMs => this.bigQueryConnection.RetryDelayMs;
+ 
++        private int RetryTotalTimeoutMs => this.bigQueryConnection.RetryTotalTimeoutMs;
++
+@@ -1097,2 +1099,2 @@
+-        private async Task<T> ExecuteWithRetriesAsync<T>(Func<Task<T>> action, Activity? activity, CancellationToken cancellationToken = default) =>
+-            await RetryManager.ExecuteWithRetriesAsync<T>(this, action, activity, MaxRetryAttempts, RetryDelayMs, cancellationToken);
++        private async Task<T> ExecuteWithRetriesAsync<T>(Func<Task<T>> action, Activity? activity, CancellationToken cancellationToken = default) =>
++            await RetryManager.ExecuteWithRetriesAsync<T>(this, action, activity, MaxRetryAttempts, RetryDelayMs, RetryTotalTimeoutMs, cancellationToken);

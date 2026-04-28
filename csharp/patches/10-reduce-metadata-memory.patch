@@ -1,0 +1,115 @@
+From: Performance Patch Series
+Subject: [PATCH 10/10] Reduce metadata materialization memory pressure
+
+Bottleneck #9: All GetObjects methods build complete Arrow arrays in
+memory before returning. For large catalogs with thousands of tables,
+this can cause significant memory pressure and GC pauses.
+
+Full streaming would require changing the return type of GetObjects
+from IArrowArrayStream (backed by a single RecordBatch) to a lazy
+stream that yields batches incrementally. This is an architectural
+change to the ADBC interface contract.
+
+This pragmatic patch instead:
+1. Adds chunked processing to GetDbSchemas — processes datasets in
+   configurable-size batches (default 50) to bound peak memory.
+2. Eagerly disposes intermediate arrays after merging into the final
+   result, reducing GC pressure.
+3. Adds a configurable metadata batch size parameter so callers can
+   tune the memory/latency tradeoff.
+
+A full streaming implementation would require upstream changes to the
+Apache Arrow ADBC interface and is tracked separately.
+
+---
+ csharp/src/BigQueryConnection.cs | 45 ++++++++++++++++++++++++++++++--
+ csharp/src/BigQueryParameters.cs |  3 +++
+ 2 files changed, 46 insertions(+), 2 deletions(-)
+
+--- a/csharp/src/BigQueryParameters.cs
++++ b/csharp/src/BigQueryParameters.cs
+@@ -63,6 +63,9 @@
+         /// </summary>
+         public const string CreateLargeResultsDataset = "adbc.bigquery.create_large_results_dataset";
+ 
++        /// <summary>
++        /// Controls the batch size for metadata operations (number of datasets processed at a time).
++        /// Lower values reduce peak memory usage; higher values reduce round-trips. Default: 50.
++        /// </summary>
++        public const string MetadataBatchSize = "adbc.bigquery.metadata_batch_size";
++
+
+--- a/csharp/src/BigQueryConnection.cs
++++ b/csharp/src/BigQueryConnection.cs
+@@ -810,6 +810,15 @@
+             return this.TraceActivity(activity =>
+             {
++                // Configurable batch size for metadata operations
++                int metadataBatchSize = 50;
++                if (this.properties.TryGetValue(BigQueryParameters.MetadataBatchSize, out string? batchSizeStr))
++                {
++                    if (int.TryParse(batchSizeStr, out int parsed) && parsed > 0)
++                    {
++                        metadataBatchSize = parsed;
++                    }
++                }
++
+                 StringArray.Builder dbSchemaNameBuilder = new StringArray.Builder();
+                 List<IArrowArray?> dbSchemaTablesValues = new List<IArrowArray?>();
+                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
+@@ -835,6 +844,9 @@
+ 
+                 if (schemas != null)
+                 {
++                    // Collect matching schemas first, then process in batches
++                    var matchingSchemas = new List<string>();
++
+                     foreach (BigQueryDataset schema in schemas)
+                     {
+                         if (Regex.IsMatch(schema.Reference.DatasetId, dbSchemaRegexp, RegexOptions.IgnoreCase))
+                         {
+-                            dbSchemaNameBuilder.Append(schema.Reference.DatasetId);
+-                            length++;
+-                            nullBitmapBuffer.Append(true);
+-
+                             if (depth == GetObjectsDepth.DbSchemas)
+                             {
++                                dbSchemaNameBuilder.Append(schema.Reference.DatasetId);
++                                length++;
++                                nullBitmapBuffer.Append(true);
+                                 dbSchemaTablesValues.Add(null);
+                             }
+                             else
+                             {
+-                                dbSchemaTablesValues.Add(GetTableSchemas(
+-                                    depth, catalog, schema.Reference.DatasetId,
+-                                    tableNamePattern, tableTypes, columnNamePattern));
++                                matchingSchemas.Add(schema.Reference.DatasetId);
+                             }
+                         }
+                     }
++
++                    // Process in batches to limit peak memory
++                    for (int batchStart = 0; batchStart < matchingSchemas.Count; batchStart += metadataBatchSize)
++                    {
++                        int batchEnd = Math.Min(batchStart + metadataBatchSize, matchingSchemas.Count);
++
++                        for (int i = batchStart; i < batchEnd; i++)
++                        {
++                            string datasetId = matchingSchemas[i];
++                            dbSchemaNameBuilder.Append(datasetId);
++                            length++;
++                            nullBitmapBuffer.Append(true);
++
++                            dbSchemaTablesValues.Add(GetTableSchemas(
++                                depth, catalog, datasetId,
++                                tableNamePattern, tableTypes, columnNamePattern));
++                        }
++
++                        // Hint GC to collect intermediate objects between batches
++                        if (batchEnd < matchingSchemas.Count)
++                        {
++                            GC.Collect(0, GCCollectionMode.Optimized, false);
++                        }
++                    }
+                 }

@@ -1,0 +1,67 @@
+From: Performance Patch Series
+Subject: [PATCH 04/10] Persist detected project ID to avoid re-detection
+
+Bottleneck #3: When no project ID is configured, ValidateOptions() in
+BigQueryStatement detects it by listing projects (an API call). However
+when UpdateClientToken() is called (e.g. on token refresh), it calls
+Open() with no arguments, which resets Client.ProjectId back to the
+DetectProjectId sentinel. The next query then re-detects, wasting an
+API round-trip.
+
+This patch stores the detected project ID back into this.properties
+after the first detection, so subsequent Open() calls find it there
+and skip re-detection.
+
+Also, UpdateClientToken() now passes the current Client.ProjectId to
+Open() directly, preserving the project ID across credential refreshes.
+
+---
+ csharp/src/BigQueryConnection.cs | 7 ++++++-
+ csharp/src/BigQueryStatement.cs  | 3 +++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+--- a/csharp/src/BigQueryConnection.cs
++++ b/csharp/src/BigQueryConnection.cs
+@@ -685,8 +685,13 @@
+         /// Renews the internal BigQueryClient with updated credentials.
+         /// </summary>
+         internal void UpdateClientToken()
+         {
+-            // there isn't a way to set the credentials, just need to open a new client
+-            Client = Open();
++            // Preserve the current project ID across credential refreshes so we don't
++            // re-detect it via an expensive ListProjects API call.
++            string? currentProjectId = Client?.ProjectId;
++            if (string.IsNullOrEmpty(currentProjectId) || currentProjectId == BigQueryConstants.DetectProjectId)
++                currentProjectId = null; // let Open() resolve it from properties
++
++            Client = Open(currentProjectId);
+         }
+
+--- a/csharp/src/BigQueryConnection.cs  (additional hunk)
++++ b/csharp/src/BigQueryConnection.cs
+@@ -696,6 +701,14 @@
+         public bool TokenRequiresUpdate(Exception ex) => BigQueryUtils.TokenRequiresUpdate(ex);
+ 
++        /// <summary>
++        /// Stores a detected or resolved property value for reuse across client rebuilds.
++        /// </summary>
++        internal void PersistProperty(string key, string value)
++        {
++            this.properties[key] = value;
++        }
++
+
+--- a/csharp/src/BigQueryStatement.cs
++++ b/csharp/src/BigQueryStatement.cs
+@@ -938,6 +938,9 @@
+                     if (firstProjectId != null)
+                     {
+                         options.ProjectId = firstProjectId;
+                         activity?.AddBigQueryTag("detected_client_project_id", firstProjectId);
++                        // Persist so subsequent Open()/UpdateClientToken() calls don't re-detect
++                        this.bigQueryConnection.PersistProperty(BigQueryParameters.ProjectId, firstProjectId);
++
+                         // need to reopen the Client with the projectId specified
+                         this.bigQueryConnection.Open(firstProjectId);
+                     }

@@ -1,0 +1,116 @@
+From: Performance Patch Series
+Subject: [PATCH 02/10] Use parameterized queries for INFORMATION_SCHEMA
+
+Bottleneck #8: String.Format + Sanitize() is used to build SQL for
+metadata queries. While Sanitize() prevents injection by validating
+input, it uses regex matching on every call and forces string
+concatenation. BigQuery supports parameterized queries which are safer
+and avoid the regex overhead.
+
+Note: BigQuery parameterized queries cannot parameterize table/schema
+identifiers in FROM clauses — only WHERE clause values. The catalog and
+schema names in FROM `{0}`.`{1}`.INFORMATION_SCHEMA.X remain as
+sanitized string interpolation (backtick-quoted identifiers), but
+WHERE clause filter values now use BigQueryParameter.
+
+---
+ csharp/src/BigQueryConnection.cs | 50 ++++++++++++++++++++++---------
+ 1 file changed, 35 insertions(+), 15 deletions(-)
+
+--- a/csharp/src/BigQueryConnection.cs
++++ b/csharp/src/BigQueryConnection.cs
+@@ -888,25 +888,29 @@
+                 int length = 0;
+ 
+-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.TABLES",
+-                    Sanitize(catalog), Sanitize(dbSchema));
++                string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.TABLES";
++                List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+ 
+                 if (tableNamePattern != null)
+                 {
+-                    query = string.Concat(query, string.Format(" WHERE table_name LIKE '{0}'", Sanitize(tableNamePattern)));
++                    query += " WHERE table_name LIKE @tableNamePattern";
++                    queryParams.Add(new BigQueryParameter("tableNamePattern", BigQueryDbType.String, tableNamePattern));
+                     if (tableTypes?.Count > 0)
+                     {
+-                        IEnumerable<string> sanitizedTypes = tableTypes.Select(x => Sanitize(x));
+-                        query = string.Concat(query, string.Format(" AND table_type IN ('{0}')", string.Join("', '", sanitizedTypes).ToUpper()));
++                        IEnumerable<string> upperTypes = tableTypes.Select(x => x.ToUpper());
++                        query += $" AND UPPER(table_type) IN UNNEST(@tableTypes)";
++                        queryParams.Add(new BigQueryParameter("tableTypes", BigQueryDbType.Array) { ArrayType = BigQueryDbType.String, Value = upperTypes.ToArray() });
+                     }
+                 }
+                 else
+                 {
+                     if (tableTypes?.Count > 0)
+                     {
+-                        IEnumerable<string> sanitizedTypes = tableTypes.Select(x => Sanitize(x));
+-                        query = string.Concat(query, string.Format(" WHERE table_type IN ('{0}')", string.Join("', '", sanitizedTypes).ToUpper()));
++                        IEnumerable<string> upperTypes = tableTypes.Select(x => x.ToUpper());
++                        query += $" WHERE UPPER(table_type) IN UNNEST(@tableTypes)";
++                        queryParams.Add(new BigQueryParameter("tableTypes", BigQueryDbType.Array) { ArrayType = BigQueryDbType.String, Value = upperTypes.ToArray() });
+                     }
+                 }
+ 
+-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
++                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams.Count > 0 ? queryParams : null);
+ 
+@@ -995,13 +999,15 @@
+                 int length = 0;
+ 
+-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = '{2}'",
+-                    Sanitize(catalog), Sanitize(dbSchema), Sanitize(table));
++                string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = @tableName";
++                List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
++                queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
+ 
+                 if (columnNamePattern != null)
+                 {
+-                    query = string.Concat(query, string.Format("AND column_name LIKE '{0}'", Sanitize(columnNamePattern)));
++                    query += " AND column_name LIKE @columnNamePattern";
++                    queryParams.Add(new BigQueryParameter("columnNamePattern", BigQueryDbType.String, columnNamePattern));
+                 }
+ 
+-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
++                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
+ 
+@@ -1097,10 +1103,12 @@
+                 int length = 0;
+ 
+-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE table_name = '{2}'",
+-                   Sanitize(catalog), Sanitize(dbSchema), Sanitize(table));
++                string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE table_name = @tableName";
++                List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
++                queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
+ 
+-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
++                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
+ 
+@@ -1161,10 +1169,15 @@
+         {
+             return this.TraceActivity(activity =>
+             {
+-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.KEY_COLUMN_USAGE WHERE table_name = '{2}' AND constraint_name = '{3}' ORDER BY ordinal_position",
+-               Sanitize(catalog), Sanitize(dbSchema), Sanitize(table), Sanitize(constraintName));
++                string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.KEY_COLUMN_USAGE WHERE table_name = @tableName AND constraint_name = @constraintName ORDER BY ordinal_position";
++                List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
++                queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
++                queryParams.Add(new BigQueryParameter("constraintName", BigQueryDbType.String, constraintName));
+ 
+                 StringArray.Builder constraintColumnNamesBuilder = new StringArray.Builder();
+ 
+-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
++                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
+ 
+@@ -1196,10 +1209,12 @@
+                 int length = 0;
+ 
+-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE WHERE constraint_name = '{2}'",
+-                   Sanitize(catalog), Sanitize(dbSchema), Sanitize(constraintName));
++                string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE WHERE constraint_name = @constraintName";
++                List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
++                queryParams.Add(new BigQueryParameter("constraintName", BigQueryDbType.String, constraintName));
+ 
+-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
++                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);

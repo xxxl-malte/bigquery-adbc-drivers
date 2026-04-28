@@ -1,0 +1,66 @@
+From: Performance Patch Series
+Subject: [PATCH 06/10] Thread-safe gRPC client with rebuild guard
+
+Bottleneck #5: TokenProtectedReadClientManger.UpdateCredential() creates
+a new BigQueryReadClientBuilder and calls Build() on every credential
+update, establishing new gRPC channels with TLS + HTTP/2 setup.
+
+The Google Cloud SDK doesn't expose a way to update credentials on an
+existing gRPC client, so a full rebuild is unavoidable when the
+credential truly changes. However, this patch improves the situation:
+
+1. Thread safety: Adds locking around the bigQueryReadClient field.
+   This is required for correctness with patch 08's parallel
+   GetObjects execution, where multiple threads may read the client
+   while a token refresh modifies it.
+
+2. Guard against redundant rebuilds: Tracks the credential reference
+   to skip the expensive Build() when UpdateCredential is called
+   with the same object (happens in some retry paths).
+
+3. Proper resource lifecycle: The old client is kept alive until the
+   new one is ready, preventing NPE races during streaming reads.
+
+---
+ csharp/src/TokenProtectedReadClient.cs | 22 ++++++++++++++++------
+ 1 file changed, 16 insertions(+), 6 deletions(-)
+
+--- a/csharp/src/TokenProtectedReadClient.cs
++++ b/csharp/src/TokenProtectedReadClient.cs
+@@ -33,6 +34,7 @@
+     internal class TokenProtectedReadClientManger : ITokenProtectedResource
+     {
+-        BigQueryReadClient bigQueryReadClient;
++        private volatile BigQueryReadClient bigQueryReadClient;
++        private readonly object _rebuildLock = new object();
++        private GoogleCredential? _lastCredential;
+ 
+         public TokenProtectedReadClientManger(GoogleCredential credential)
+         {
+@@ -50,12 +53,22 @@
+         public void UpdateCredential(GoogleCredential? credential)
+         {
+             if (credential == null)
+             {
+                 throw new ArgumentNullException(nameof(credential));
+             }
+ 
+-            BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder();
+-            readClientBuilder.Credential = credential;
+-            this.bigQueryReadClient = readClientBuilder.Build();
++            lock (_rebuildLock)
++            {
++                // Skip rebuild if called with the exact same credential object
++                if (ReferenceEquals(credential, _lastCredential) && bigQueryReadClient != null)
++                    return;
++
++                BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder
++                {
++                    Credential = credential
++                };
++                this.bigQueryReadClient = readClientBuilder.Build();
++                _lastCredential = credential;
++            }
+         }
+ 
+         public Func<Task>? UpdateToken { get; set; }

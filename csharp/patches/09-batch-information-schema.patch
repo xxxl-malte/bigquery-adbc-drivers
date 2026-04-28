@@ -1,0 +1,283 @@
+From: Performance Patch Series
+Subject: [PATCH 09/10] Batch INFORMATION_SCHEMA queries per dataset
+
+Bottleneck #1 (N+1 queries): GetColumnSchema and GetConstraintSchema
+issue one INFORMATION_SCHEMA query per table. For a dataset with N
+tables, this produces N+1 queries (1 for TABLES, N for COLUMNS) plus
+additional constraint queries.
+
+This patch introduces a batch approach:
+- Fetch ALL columns for the dataset in one query (with optional
+  columnNamePattern filter), then partition results in memory by
+  table_name.
+- Fetch ALL table constraints for the dataset in one query, then
+  partition by table_name.
+- KEY_COLUMN_USAGE and CONSTRAINT_COLUMN_USAGE remain per-constraint
+  queries (few constraints per table makes this acceptable).
+
+This reduces the column query count from O(N) to O(1) per dataset
+and constraint query count from O(N) to O(1) per dataset, which
+dramatically reduces latency for datasets with many tables.
+
+The pre-fetched data is passed to the existing builder methods as
+dictionaries keyed by table name, avoiding changes to the Arrow
+array construction logic.
+
+---
+ csharp/src/BigQueryConnection.cs | 165 ++++++++++++++++++++++++++-----
+ 1 file changed, 140 insertions(+), 25 deletions(-)
+
+--- a/csharp/src/BigQueryConnection.cs
++++ b/csharp/src/BigQueryConnection.cs
+@@ -874,6 +874,68 @@
++        /// <summary>
++        /// Pre-fetches all column metadata for a dataset in one query, partitioned by table name.
++        /// </summary>
++        private Dictionary<string, List<BigQueryRow>> BatchFetchColumns(
++            string catalog, string dbSchema, string? columnNamePattern)
++        {
++            string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.COLUMNS";
++            List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
++
++            if (columnNamePattern != null)
++            {
++                query += " WHERE column_name LIKE @columnNamePattern";
++                queryParams.Add(new BigQueryParameter("columnNamePattern", BigQueryDbType.String, columnNamePattern));
++            }
++
++            query += " ORDER BY table_name, ordinal_position";
++
++            var result = ExecuteQuery(query, parameters: queryParams.Count > 0 ? queryParams : null);
++            var grouped = new Dictionary<string, List<BigQueryRow>>(StringComparer.OrdinalIgnoreCase);
++
++            if (result != null)
++            {
++                foreach (BigQueryRow row in result)
++                {
++                    string tableName = GetValue(row["table_name"]);
++                    if (!grouped.TryGetValue(tableName, out var list))
++                    {
++                        list = new List<BigQueryRow>();
++                        grouped[tableName] = list;
++                    }
++                    list.Add(row);
++                }
++            }
++
++            return grouped;
++        }
++
++        /// <summary>
++        /// Pre-fetches all table constraints for a dataset in one query, partitioned by table name.
++        /// </summary>
++        private Dictionary<string, List<BigQueryRow>> BatchFetchConstraints(
++            string catalog, string dbSchema)
++        {
++            string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS";
++
++            var result = ExecuteQuery(query, parameters: null);
++            var grouped = new Dictionary<string, List<BigQueryRow>>(StringComparer.OrdinalIgnoreCase);
++
++            if (result != null)
++            {
++                foreach (BigQueryRow row in result)
++                {
++                    string tableName = GetValue(row["table_name"]);
++                    if (!grouped.TryGetValue(tableName, out var list))
++                    {
++                        list = new List<BigQueryRow>();
++                        grouped[tableName] = list;
++                    }
++                    list.Add(row);
++                }
++            }
++
++            return grouped;
++        }
++
+         private StructArray GetTableSchemas(
+             GetObjectsDepth depth,
+             string catalog,
+@@ -912,6 +974,20 @@
+ 
+                 BigQueryResults? result = ExecuteQuery(query, parameters: queryParams.Count > 0 ? queryParams : null);
+ 
++                // Pre-fetch column and constraint data for the entire dataset
++                Dictionary<string, List<BigQueryRow>>? batchedColumns = null;
++                Dictionary<string, List<BigQueryRow>>? batchedConstraints = null;
++
++                if (depth != GetObjectsDepth.Tables)
++                {
++                    batchedColumns = BatchFetchColumns(catalog, dbSchema, columnNamePattern);
++                }
++
++                if (depth == GetObjectsDepth.All && includeConstraints)
++                {
++                    batchedConstraints = BatchFetchConstraints(catalog, dbSchema);
++                }
++
+                 if (result != null)
+                 {
+                     // Collect table info first, then fetch details in parallel
+@@ -935,10 +1011,23 @@
+                             if (depth != GetObjectsDepth.Tables)
+                             {
+-                                columnResults[i] = GetColumnSchema(catalog, dbSchema, tableName, columnNamePattern);
++                                // Use batched data if available, fall back to per-table query
++                                if (batchedColumns != null)
++                                {
++                                    batchedColumns.TryGetValue(tableName, out var rows);
++                                    columnResults[i] = BuildColumnSchemaFromRows(rows);
++                                }
++                                else
++                                {
++                                    columnResults[i] = GetColumnSchema(catalog, dbSchema, tableName, columnNamePattern);
++                                }
+                             }
+ 
+                             if (depth == GetObjectsDepth.All && includeConstraints)
+                             {
+-                                constraintResults[i] = GetConstraintSchema(depth, catalog, dbSchema, tableName, columnNamePattern);
++                                if (batchedConstraints != null)
++                                {
++                                    batchedConstraints.TryGetValue(tableName, out var rows);
++                                    constraintResults[i] = BuildConstraintSchemaFromRows(depth, catalog, dbSchema, tableName, rows);
++                                }
++                                else
++                                {
++                                    constraintResults[i] = GetConstraintSchema(depth, catalog, dbSchema, tableName, columnNamePattern);
++                                }
+                             }
+                         });
+                     }
+ 
+@@ -1082,6 +1171,57 @@
+             }, ClassName + "." + nameof(GetColumnSchema));
+         }
+ 
++        /// <summary>
++        /// Builds a ColumnSchema StructArray from pre-fetched rows (avoids per-table query).
++        /// </summary>
++        private StructArray BuildColumnSchemaFromRows(List<BigQueryRow>? rows)
++        {
++            StringArray.Builder columnNameBuilder = new StringArray.Builder();
++            Int32Array.Builder ordinalPositionBuilder = new Int32Array.Builder();
++            StringArray.Builder remarksBuilder = new StringArray.Builder();
++            Int16Array.Builder xdbcDataTypeBuilder = new Int16Array.Builder();
++            StringArray.Builder xdbcTypeNameBuilder = new StringArray.Builder();
++            Int32Array.Builder xdbcColumnSizeBuilder = new Int32Array.Builder();
++            Int16Array.Builder xdbcDecimalDigitsBuilder = new Int16Array.Builder();
++            Int16Array.Builder xdbcNumPrecRadixBuilder = new Int16Array.Builder();
++            Int16Array.Builder xdbcNullableBuilder = new Int16Array.Builder();
++            StringArray.Builder xdbcColumnDefBuilder = new StringArray.Builder();
++            Int16Array.Builder xdbcSqlDataTypeBuilder = new Int16Array.Builder();
++            Int16Array.Builder xdbcDatetimeSubBuilder = new Int16Array.Builder();
++            Int32Array.Builder xdbcCharOctetLengthBuilder = new Int32Array.Builder();
++            StringArray.Builder xdbcIsNullableBuilder = new StringArray.Builder();
++            StringArray.Builder xdbcScopeCatalogBuilder = new StringArray.Builder();
++            StringArray.Builder xdbcScopeSchemaBuilder = new StringArray.Builder();
++            StringArray.Builder xdbcScopeTableBuilder = new StringArray.Builder();
++            BooleanArray.Builder xdbcIsAutoincrementBuilder = new BooleanArray.Builder();
++            BooleanArray.Builder xdbcIsGeneratedcolumnBuilder = new BooleanArray.Builder();
++            ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
++            int length = 0;
++
++            if (rows != null)
++            {
++                foreach (BigQueryRow row in rows)
++                {
++                    // Same logic as GetColumnSchema's inner loop
++                    columnNameBuilder.Append(GetValue(row["column_name"]));
++                    ordinalPositionBuilder.Append((int)(long)row["ordinal_position"]);
++                    remarksBuilder.Append("");
++                    string dataType = ToTypeName(GetValue(row["data_type"]), out string suffix);
++                    if ((dataType.StartsWith("NUMERIC") || dataType.StartsWith("DECIMAL") ||
++                         dataType.StartsWith("BIGNUMERIC") || dataType.StartsWith("BIGDECIMAL"))
++                        && !string.IsNullOrEmpty(suffix))
++                    {
++                        ParsedDecimalValues values = ParsePrecisionAndScale(suffix);
++                        xdbcColumnSizeBuilder.Append(values.Precision);
++                        xdbcDecimalDigitsBuilder.Append(Convert.ToInt16(values.Scale));
++                    }
++                    else { xdbcColumnSizeBuilder.AppendNull(); xdbcDecimalDigitsBuilder.AppendNull(); }
++                    xdbcDataTypeBuilder.AppendNull();
++                    xdbcTypeNameBuilder.Append(dataType);
++                    xdbcNumPrecRadixBuilder.AppendNull(); xdbcNullableBuilder.AppendNull();
++                    xdbcColumnDefBuilder.AppendNull();
++                    xdbcSqlDataTypeBuilder.Append((short)ToXdbcDataType(dataType));
++                    xdbcDatetimeSubBuilder.AppendNull(); xdbcCharOctetLengthBuilder.AppendNull();
++                    xdbcIsNullableBuilder.Append(row["is_nullable"].ToString());
++                    xdbcScopeCatalogBuilder.AppendNull(); xdbcScopeSchemaBuilder.AppendNull();
++                    xdbcScopeTableBuilder.AppendNull(); xdbcIsAutoincrementBuilder.AppendNull();
++                    xdbcIsGeneratedcolumnBuilder.Append(GetValue(row["is_generated"]).ToUpper() == "YES");
++                    nullBitmapBuffer.Append(true);
++                    length++;
++                }
++            }
++
++            IArrowArray[] dataArrays = new IArrowArray[]
++            {
++                columnNameBuilder.Build(), ordinalPositionBuilder.Build(), remarksBuilder.Build(),
++                xdbcDataTypeBuilder.Build(), xdbcTypeNameBuilder.Build(), xdbcColumnSizeBuilder.Build(),
++                xdbcDecimalDigitsBuilder.Build(), xdbcNumPrecRadixBuilder.Build(), xdbcNullableBuilder.Build(),
++                xdbcColumnDefBuilder.Build(), xdbcSqlDataTypeBuilder.Build(), xdbcDatetimeSubBuilder.Build(),
++                xdbcCharOctetLengthBuilder.Build(), xdbcIsNullableBuilder.Build(), xdbcScopeCatalogBuilder.Build(),
++                xdbcScopeSchemaBuilder.Build(), xdbcScopeTableBuilder.Build(), xdbcIsAutoincrementBuilder.Build(),
++                xdbcIsGeneratedcolumnBuilder.Build()
++            };
++            StandardSchemas.ColumnSchema.Validate(dataArrays);
++            return new StructArray(new StructType(StandardSchemas.ColumnSchema), length, dataArrays, nullBitmapBuffer.Build());
++        }
++
++        /// <summary>
++        /// Builds a ConstraintSchema StructArray from pre-fetched constraint rows.
++        /// </summary>
++        private StructArray BuildConstraintSchemaFromRows(
++            GetObjectsDepth depth, string catalog, string dbSchema, string table,
++            List<BigQueryRow>? rows)
++        {
++            StringArray.Builder constraintNameBuilder = new StringArray.Builder();
++            StringArray.Builder constraintTypeBuilder = new StringArray.Builder();
++            List<IArrowArray?> constraintColumnNamesValues = new List<IArrowArray?>();
++            List<IArrowArray?> constraintColumnUsageValues = new List<IArrowArray?>();
++            ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
++            int length = 0;
++
++            if (rows != null)
++            {
++                foreach (BigQueryRow row in rows)
++                {
++                    string constraintName = GetValue(row["constraint_name"]);
++                    constraintNameBuilder.Append(constraintName);
++                    string constraintType = GetValue(row["constraint_type"]);
++                    constraintTypeBuilder.Append(constraintType);
++                    nullBitmapBuffer.Append(true);
++                    length++;
++
++                    if (depth == GetObjectsDepth.All || depth == GetObjectsDepth.Tables)
++                    {
++                        // These still issue per-constraint queries (batching KEY_COLUMN_USAGE
++                        // across all constraints would require a more complex join approach)
++                        constraintColumnNamesValues.Add(GetConstraintColumnNames(catalog, dbSchema, table, constraintName));
++                        if (constraintType.ToUpper() == "FOREIGN KEY")
++                            constraintColumnUsageValues.Add(GetConstraintsUsage(catalog, dbSchema, table, constraintName));
++                        else
++                            constraintColumnUsageValues.Add(null);
++                    }
++                    else
++                    {
++                        constraintColumnNamesValues.Add(null);
++                        constraintColumnUsageValues.Add(null);
++                    }
++                }
++            }
++
++            IArrowArray[] dataArrays = new IArrowArray[]
++            {
++                constraintNameBuilder.Build(), constraintTypeBuilder.Build(),
++                constraintColumnNamesValues.BuildListArrayForType(StringType.Default),
++                constraintColumnUsageValues.BuildListArrayForType(new StructType(StandardSchemas.UsageSchema))
++            };
++            StandardSchemas.ConstraintSchema.Validate(dataArrays);
++            return new StructArray(new StructType(StandardSchemas.ConstraintSchema), length, dataArrays, nullBitmapBuffer.Build());
++        }
