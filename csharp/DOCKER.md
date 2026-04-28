@@ -10,6 +10,25 @@ Build, test, and develop the C# driver without installing the .NET SDK on your h
   git submodule update --init --recursive
   ```
 
+## Environment Setup
+
+All credential paths are configured through a `.env` file read by docker-compose.
+
+```sh
+cd csharp/
+cp .env.sample .env
+```
+
+Edit `.env` and set the paths to your credential/config files:
+
+```dotenv
+GOOGLE_APPLICATION_CREDENTIALS=./secrets/service-account.json
+BIGQUERY_TEST_CONFIG_FILE=./secrets/bigqueryconfig.json
+BIGQUERY_PERF_CONFIG_FILE=./secrets/perfconfig.json
+```
+
+> **Note:** `.env` and `secrets/` are gitignored — they are never committed.
+
 ## Services
 
 | Service | Purpose |
@@ -18,6 +37,7 @@ Build, test, and develop the C# driver without installing the .NET SDK on your h
 | `test` | Run unit tests (no credentials needed) |
 | `dev` | Interactive bash shell with live-mounted source |
 | `integration-test` | Run full test suite against a real BigQuery instance |
+| `perf-test` | Run performance benchmarks against a real BigQuery table |
 
 ## Quick Start
 
@@ -39,26 +59,22 @@ docker compose run --rm dev
 
 ## Running Integration Tests
 
-Integration tests connect to a real BigQuery instance and require two things:
+Integration tests connect to a real BigQuery instance and require:
 
-### 1. A test configuration file
+1. **A test configuration file** — based on `test/Resources/bigqueryconfig.json`
+2. **Paths set in `.env`** — so docker-compose can mount them into the container
 
-Create a JSON config file based on the template at `test/Resources/bigqueryconfig.json`.
-A minimal working example:
+### 1. Create a test configuration file
+
+Place it in `secrets/` (gitignored). Minimal example:
 
 ```json
 {
     "testEnvironments": ["dev"],
-    "shared": {
-        "clientId": "YOUR_OAUTH_CLIENT_ID",
-        "clientSecret": "YOUR_OAUTH_CLIENT_SECRET"
-    },
     "environments": {
         "dev": {
             "projectId": "your-gcp-project-id",
-            "clientId": "$ref:shared.clientId",
-            "clientSecret": "$ref:shared.clientSecret",
-            "refreshToken": "YOUR_REFRESH_TOKEN",
+            "authenticationType": "service",
             "maxStreamCount": 1,
             "metadata": {
                 "catalog": "your-gcp-project-id",
@@ -73,44 +89,32 @@ A minimal working example:
 }
 ```
 
+For **OAuth (user)** auth, add `clientId`, `clientSecret`, and `refreshToken` directly
+in the environment block (or use the `shared` / `$ref:shared.*` pattern — see
+`test/readme.md` for full details).
+
 > **Tip:** Run `test/Resources/BigQueryData.sql` against your BigQuery instance first
 > to create the expected test data.
 
-See `test/readme.md` for the full list of configuration options including
-`billingProjectId`, `scopes`, `queryTimeout`, `allowLargeResults`, and others.
+### 2. Set paths in `.env`
 
-### 2. Run with the config file mounted
-
-```sh
-# Point to your config file
-export BIGQUERY_TEST_CONFIG_FILE=/path/to/your/bigqueryconfig.json
-
-docker compose run --rm \
-  -e BIGQUERY_TEST_CONFIG_FILE=/config/bigqueryconfig.json \
-  -v "$BIGQUERY_TEST_CONFIG_FILE:/config/bigqueryconfig.json:ro" \
-  integration-test
+```dotenv
+GOOGLE_APPLICATION_CREDENTIALS=./secrets/service-account.json
+BIGQUERY_TEST_CONFIG_FILE=./secrets/bigqueryconfig.json
 ```
 
-If your tests use **service account** authentication instead of OAuth, also mount the
-service account key:
+### 3. Run
 
 ```sh
-docker compose run --rm \
-  -e BIGQUERY_TEST_CONFIG_FILE=/config/bigqueryconfig.json \
-  -e GOOGLE_APPLICATION_CREDENTIALS=/secrets/service-account.json \
-  -v "/path/to/bigqueryconfig.json:/config/bigqueryconfig.json:ro" \
-  -v "/path/to/service-account.json:/secrets/service-account.json:ro" \
-  integration-test
+docker compose run --rm integration-test
 ```
 
 ### Authentication types
 
-The test config supports three `authenticationType` values:
-
-| Type | Required fields |
+| Type | Required fields in test config JSON |
 |---|---|
 | `user` | `clientId`, `clientSecret`, `refreshToken` |
-| `service` | Service account JSON via `GOOGLE_APPLICATION_CREDENTIALS` |
+| `service` | `jsonCredential` in JSON, or mount service account via `GOOGLE_APPLICATION_CREDENTIALS` |
 | `aad` | `accessToken`, `audience` (Microsoft Entra) |
 
 ## Development Shell
@@ -132,3 +136,65 @@ After changing source files (outside the `dev` service), rebuild images:
 ```sh
 docker compose build
 ```
+
+## Running Performance Tests
+
+Performance tests measure full table import throughput. They are a **separate** project
+under `perf/` and do not run with the integration tests.
+
+### 1. Create a perf config file
+
+Copy `perf/perfconfig.sample.json` and fill in your details:
+
+```json
+{
+    "environments": [
+        {
+            "name": "default",
+            "projectId": "your-gcp-project-id",
+            "authenticationType": "service",
+            "jsonCredential": "{ ... service account JSON ... }",
+            "catalog": "your-gcp-project-id",
+            "schema": "your_dataset",
+            "table": "your_table",
+            "maxStreamCount": 0,
+            "allowLargeResults": false,
+            "iterations": 3
+        }
+    ]
+}
+```
+
+| Field | Description |
+|---|---|
+| `catalog` | BigQuery project containing the table |
+| `schema` | BigQuery dataset |
+| `table` | Table to import (SELECT *) |
+| `maxStreamCount` | Parallel read streams (`0` = server default) |
+| `iterations` | Number of repeated runs for the `MeasureFullTableImportRepeated` test |
+
+### 2. Set the path in `.env`
+
+```dotenv
+BIGQUERY_PERF_CONFIG_FILE=./secrets/perfconfig.json
+```
+
+### 3. Run the perf tests
+
+```sh
+docker compose run --rm perf-test
+```
+
+To run a specific test:
+
+```sh
+docker compose run --rm perf-test \
+  --filter "FullyQualifiedName~MeasureFullTableImport"
+```
+
+### Test descriptions
+
+| Test | What it measures |
+|---|---|
+| `MeasureFullTableImport` | Single run with detailed phase breakdown (connect, query, read) and throughput stats |
+| `MeasureFullTableImportRepeated` | Multiple runs with min/max/avg/stddev statistics |

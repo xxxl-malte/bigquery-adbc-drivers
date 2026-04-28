@@ -34,11 +34,15 @@ services:
       - DOTNET_CLI_TELEMETRY_OPTOUT=1
 
   # Run integration tests (requires BigQuery credentials)
+  # Reads GOOGLE_APPLICATION_CREDENTIALS and BIGQUERY_TEST_CONFIG_FILE from .env
   integration-test:
     build:
       context: .
       dockerfile: Dockerfile
       target: test
+    env_file:
+      - path: .env
+        required: false
     entrypoint:
       - dotnet
       - test
@@ -49,7 +53,23 @@ services:
       - --logger
       - console;verbosity=detailed
     environment:
+      - BIGQUERY_TEST_CONFIG_FILE=/config/bigqueryconfig.json
       - GOOGLE_APPLICATION_CREDENTIALS=/secrets/service-account.json
     volumes:
-      # Mount your GCP service account key
+      - ${BIGQUERY_TEST_CONFIG_FILE:-./secrets/bigqueryconfig.json}:/config/bigqueryconfig.json:ro
       - ${GOOGLE_APPLICATION_CREDENTIALS:-./secrets/service-account.json}:/secrets/service-account.json:ro
+
+  # Run performance tests (requires BigQuery credentials + perf config)
+  # Reads BIGQUERY_PERF_CONFIG_FILE from .env
+  perf-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: perf
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - BIGQUERY_PERF_CONFIG_FILE=/config/perfconfig.json
+    volumes:
+      - ${BIGQUERY_PERF_CONFIG_FILE:-./secrets/perfconfig.json}:/config/perfconfig.json:ro

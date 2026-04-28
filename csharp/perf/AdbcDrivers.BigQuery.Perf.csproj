@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Azure.Identity" Version="1.17.1" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.4.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\arrow-adbc\csharp\src\Client\Apache.Arrow.Adbc.Client.csproj" />
+    <ProjectReference Include="..\arrow-adbc\csharp\test\Apache.Arrow.Adbc.Tests\Apache.Arrow.Adbc.Testing.csproj" />
+    <ProjectReference Include="..\src\AdbcDrivers.BigQuery.csproj" />
+  </ItemGroup>
+</Project>

@@ -255,3 +255,9 @@ __marimo__/
 
 .doit.db
 validation-report.xml
+
+# C# performance test config (contains credentials)
+csharp/perf/perfconfig.json
+
+# C# secrets directory (service account keys, test configs)
+csharp/secrets/

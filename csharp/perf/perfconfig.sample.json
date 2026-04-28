@@ -1,0 +1,16 @@
+{
+    "environments": [
+        {
+            "name": "default",
+            "projectId": "your-gcp-project-id",
+            "authenticationType": "service",
+            "jsonCredential": "{ ... your service account JSON ... }",
+            "catalog": "your-gcp-project-id",
+            "schema": "your_dataset",
+            "table": "your_table",
+            "maxStreamCount": 0,
+            "allowLargeResults": false,
+            "iterations": 3
+        }
+    ]
+}

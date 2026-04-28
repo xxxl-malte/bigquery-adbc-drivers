@@ -16,6 +16,12 @@ Thumbs.db
 # Documentation (keep readmes needed by csproj)
 BOTTLENECKS.md
 
+# Secrets / credentials — never bake into images
+.env
+.env.*
+!.env.sample
+secrets/
+
 # Symlink — excluded so Docker doesn't resolve it into real files,
 # which breaks .NET SDK globbing (type conflicts with the referenced assembly).
 # The ProjectReference paths already point directly into arrow-adbc/.
