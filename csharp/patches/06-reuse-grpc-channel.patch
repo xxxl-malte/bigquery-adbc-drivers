@@ -2,8 +2,8 @@ From: Performance Patch Series
 Subject: [PATCH 06/16] 06-reuse-grpc-channel
 
 ---
- csharp/src/TokenProtectedReadClient.cs | 24 ++++++++++++++++++++----
- 1 file changed, 20 insertions(+), 4 deletions(-)
+ csharp/src/TokenProtectedReadClient.cs | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
 
 diff --git a/csharp/src/TokenProtectedReadClient.cs b/csharp/src/TokenProtectedReadClient.cs
 index 0eb2e79..c47cb58 100644
@@ -20,7 +20,7 @@ index 0eb2e79..c47cb58 100644
  
          public TokenProtectedReadClientManger(GoogleCredential credential)
          {
-@@ -54,9 +56,23 @@ namespace AdbcDrivers.BigQuery
+@@ -54,9 +56,16 @@ namespace AdbcDrivers.BigQuery
                  throw new ArgumentNullException(nameof(credential));
              }
  
@@ -32,17 +32,10 @@ index 0eb2e79..c47cb58 100644
 +                if (ReferenceEquals(credential, _lastCredential) && bigQueryReadClient != null)
 +                    return;
 +
-+                var oldClient = this.bigQueryReadClient;
-+
 +                BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder();
 +                readClientBuilder.Credential = credential;
 +                this.bigQueryReadClient = readClientBuilder.Build();
 +                _lastCredential = credential;
-+
-+                if (oldClient != null)
-+                {
-+                    _ = oldClient.ShutdownChannelAsync();
-+                }
 +            }
          }
  

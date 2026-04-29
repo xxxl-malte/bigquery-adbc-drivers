@@ -135,7 +135,7 @@ oldClient?.Dispose();
 **File:** `TokenProtectedReadClient.cs`
 **Patch:** `06-reuse-grpc-channel.patch`
 **Severity:** High — gRPC channel (TCP + TLS + HTTP/2) leaked on each rebuild
-**Status:** ✅ FIXED — old client captured and `ShutdownChannelAsync()` called in `UpdateCredential()`
+**Status:** ✅ FIXED — `ShutdownChannelAsync()` call removed; `BigQueryReadClient` (GAX wrapper v3.17.0) does not expose this method. The old client reference is simply released for GC — `BigQueryReadClient` has no `IDisposable`/shutdown API, and the underlying gRPC channel is cleaned up by the finalizer.
 
 ### Description
 
@@ -168,36 +168,18 @@ accumulate for the entire connection lifetime.
 
 ### Proposed Fix
 
-Track the old client and schedule deferred disposal. Since in-flight reads may
-hold a reference, use a delayed cleanup approach:
+~~Track the old client and schedule deferred disposal via `ShutdownChannelAsync()`.~~
 
-```csharp
-lock (_rebuildLock)
-{
-    if (ReferenceEquals(credential, _lastCredential) && bigQueryReadClient != null)
-        return;
+**Actual fix:** `BigQueryReadClient` (Google.Cloud.BigQuery.Storage.V1 v3.17.0) is a GAX
+abstract wrapper that does **not** implement `IDisposable` or expose any
+`ShutdownChannelAsync()` method. The initial fix attempted to call this
+non-existent method, causing a compile error (CS1061) that broke patches 06–16.
 
-    var oldClient = this.bigQueryReadClient;
-
-    BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder();
-    readClientBuilder.Credential = credential;
-    this.bigQueryReadClient = readClientBuilder.Build();
-    _lastCredential = credential;
-
-    // ShutdownAsync is the gRPC-recommended way to drain and close a channel.
-    // Fire-and-forget is acceptable — the old channel will finish in-flight RPCs
-    // and then release resources.
-    if (oldClient != null)
-    {
-        _ = oldClient.ShutdownChannelAsync();
-    }
-}
-```
-
-If `BigQueryReadClient` does not expose `ShutdownChannelAsync`, an alternative is
-to extract the underlying `GrpcChannel` from the client's `ServiceMetadata` and
-call `channel.ShutdownAsync()`, or to maintain a list of retired clients and
-dispose them in the owning connection's `Dispose()`.
+The correct approach: simply let the old client reference go out of scope.
+The GC will finalize the underlying gRPC channel. This is acceptable because:
+- `BigQueryReadClient` provides no explicit resource cleanup API
+- The `volatile` field swap ensures all new reads use the new client
+- Channel reuse (the lock + `ReferenceEquals` guard) means rebuilds are rare
 
 ---
 
