@@ -316,9 +316,9 @@ write_perftests_md() {
         fi
 
         # Patch rows
-        for ((i = 0; i < TOTAL_PATCHES; i++)); do
-            test_id="patch$(printf '%02d' $((i+1)))"
-            patch_name="$(basename "${PATCH_FILES[$i]}" .patch)"
+        for ((pi = 0; pi < TOTAL_PATCHES; pi++)); do
+            test_id="patch$(printf '%02d' $((pi+1)))"
+            patch_name="$(basename "${PATCH_FILES[$pi]}" .patch)"
             status=$(cat "$RESULTS_DIR/${test_id}_status" 2>/dev/null || echo "PENDING")
             completed=$(cat "$RESULTS_DIR/${test_id}_completed" 2>/dev/null || echo "-")
             emoji=$(status_emoji "$status")
@@ -326,9 +326,9 @@ write_perftests_md() {
             if [[ "$status" == "PASSED" ]]; then
                 metrics=$(parse_test_output "$test_id")
                 IFS='|' read -r rows batches time thr_rows thr_bytes <<< "$metrics"
-                echo "| $((i+1)) | +$patch_name | $emoji $status | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes |"
+                echo "| $((pi+1)) | +$patch_name | $emoji $status | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes |"
             else
-                echo "| $((i+1)) | +$patch_name | $emoji $status | $completed | - | - | - | - | - |"
+                echo "| $((pi+1)) | +$patch_name | $emoji $status | $completed | - | - | - | - | - |"
             fi
         done
 
@@ -354,15 +354,15 @@ write_perftests_md() {
             echo ""
         fi
 
-        for ((i = 0; i < TOTAL_PATCHES; i++)); do
-            test_id="patch$(printf '%02d' $((i+1)))"
-            patch_name="$(basename "${PATCH_FILES[$i]}" .patch)"
+        for ((pi = 0; pi < TOTAL_PATCHES; pi++)); do
+            test_id="patch$(printf '%02d' $((pi+1)))"
+            patch_name="$(basename "${PATCH_FILES[$pi]}" .patch)"
 
             # Only emit detail section if the test has run
             if [[ -f "$RESULTS_DIR/${test_id}_status" ]]; then
-                echo "### Patch $((i+1)): $patch_name"
+                echo "### Patch $((pi+1)): $patch_name"
                 echo ""
-                echo "**Cumulative patches applied:** $(seq 1 $((i+1)) | while read n; do printf "P%s" "$n"; done | sed 's/P/, P/g; s/^, //')"
+                echo "**Cumulative patches applied:** $(seq 1 $((pi+1)) | while read n; do printf "P%s" "$n"; done | sed 's/P/, P/g; s/^, //')"
                 echo "**Completed:** $(cat "$RESULTS_DIR/${test_id}_completed" 2>/dev/null || echo "N/A")"
                 echo "**Wall-clock time:** $(cat "$RESULTS_DIR/${test_id}_wallclock" 2>/dev/null || echo "N/A")s"
                 echo ""
