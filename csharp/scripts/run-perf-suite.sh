@@ -7,7 +7,9 @@
 # the previous, measuring cumulative impact.
 #
 # Results are written to PERFTESTS.md with both a summary table
-# and detailed per-test sections.
+# and detailed per-test sections. The file is atomically updated
+# after each test run so it always reflects the latest state, even
+# if the suite is interrupted.
 #
 # Usage:
 #   ./scripts/run-perf-suite.sh [OPTIONS]
@@ -38,6 +40,10 @@ SKIP_BASELINE=false
 ONLY_UPTO=-1  # -1 means all
 ENV_FILE="$CSHARP_DIR/.env"
 DOCKER_IMAGE="mcr.microsoft.com/dotnet/sdk:8.0"
+
+# Track suite state
+SUITE_START_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+SUITE_COMPLETED=false
 
 # ----- parse args -----
 while [[ $# -gt 0 ]]; do
@@ -104,11 +110,14 @@ echo "Creating worktree at $WORKTREE_DIR ..."
 
 cleanup() {
     echo ""
-    # Write final PERFTESTS.md snapshot so no results are lost on interrupt
-    if [[ -n "${RESULTS_DIR:-}" ]] && [[ -d "$RESULTS_DIR" ]]; then
-        write_perftests_md 2>/dev/null || true
+    # Write final PERFTESTS.md only on abnormal exit (interrupt/error).
+    # Normal completion already wrote the final version in the main loop.
+    if [[ "$SUITE_COMPLETED" == false ]] && [[ -n "${RESULTS_DIR:-}" ]] && [[ -d "$RESULTS_DIR" ]]; then
+        write_perftests_md || true
         echo "Results saved to $OUTPUT_FILE"
     fi
+    # Clean up any leftover temp files from atomic writes
+    rm -f "${OUTPUT_FILE}.tmp."* 2>/dev/null || true
     echo "Cleaning up worktree..."
     cd "$REPO_ROOT"
     git worktree remove --force "$WORKTREE_DIR" 2>/dev/null || rm -rf "$WORKTREE_DIR"
@@ -259,16 +268,23 @@ parse_test_output() {
 
     # Parse metrics from the test's ITestOutputHelper output
     # Format: "  Total rows:       25,034,075"
+    #
+    # NOTE: Each extraction uses `{ sed ... || true; }` to prevent SIGPIPE
+    # failures. When `head -1` closes the pipe after the first match, sed
+    # receives SIGPIPE and exits with 141. Under `set -o pipefail`, this
+    # would propagate as a non-zero pipeline exit, causing `set -e` to
+    # abort the entire script mid-write of PERFTESTS.md — truncating the
+    # file and losing all accumulated results.
     local total_rows total_batches total_time throughput_rows throughput_bytes
 
-    total_rows=$(sed -n 's/.*Total rows:[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" | head -1)
-    total_batches=$(sed -n 's/.*Total batches:[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" | head -1)
+    total_rows=$({ sed -n 's/.*Total rows:[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" || true; } | head -1)
+    total_batches=$({ sed -n 's/.*Total batches:[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" || true; } | head -1)
     # Total time is in TimeSpan format: "00:47:25.3457848"
-    total_time=$(sed -n 's/.*Total:[[:space:]]*\([0-9.:]*\).*/\1/p' "$output_file" | head -1)
+    total_time=$({ sed -n 's/.*Total:[[:space:]]*\([0-9.:]*\).*/\1/p' "$output_file" || true; } | head -1)
     # Rows/sec (read): 8,812
-    throughput_rows=$(sed -n 's/.*Rows\/sec (read):[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" | head -1)
+    throughput_rows=$({ sed -n 's/.*Rows\/sec (read):[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" || true; } | head -1)
     # Bytes/sec (read): 1,381,763 (1.32 MB/s)
-    throughput_bytes=$(sed -n 's/.*Bytes\/sec (read):[[:space:]]*[0-9,]* (\([^)]*\)).*/\1/p' "$output_file" | head -1)
+    throughput_bytes=$({ sed -n 's/.*Bytes\/sec (read):[[:space:]]*[0-9,]* (\([^)]*\)).*/\1/p' "$output_file" || true; } | head -1)
 
     echo "${total_rows:-N/A}|${total_batches:-N/A}|${total_time:-N/A}|${throughput_rows:-N/A}|${throughput_bytes:-N/A}"
 }
@@ -286,12 +302,20 @@ status_emoji() {
 # ----- helper: (re)generate PERFTESTS.md from current results -----
 # Called after every test run so the file always reflects the latest state.
 # Tests not yet started appear as ⏳ PENDING.
+#
+# Uses atomic writes: generates content in a temp file, then renames it
+# to the output path. This prevents data loss if the script is killed
+# mid-write (a bare `> file` would truncate first, leaving partial content).
 write_perftests_md() {
+    local tmp_file
+    tmp_file="$(mktemp "${OUTPUT_FILE}.tmp.XXXXXX")"
+
     {
         echo "# Performance Test Results"
         echo ""
         echo "**Commit:** \`$COMMIT_SHA\`"
-        echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "**Suite started:** $SUITE_START_TIME"
+        echo "**Last updated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "**Patches:** $TOTAL_PATCHES applied incrementally"
         echo ""
 
@@ -303,6 +327,7 @@ write_perftests_md() {
 
         # Baseline row
         if [[ "$SKIP_BASELINE" == false ]]; then
+            local status completed emoji metrics rows batches time thr_rows thr_bytes
             status=$(cat "$RESULTS_DIR/baseline_status" 2>/dev/null || echo "PENDING")
             completed=$(cat "$RESULTS_DIR/baseline_completed" 2>/dev/null || echo "-")
             emoji=$(status_emoji "$status")
@@ -316,6 +341,7 @@ write_perftests_md() {
         fi
 
         # Patch rows
+        local pi test_id patch_name status completed emoji metrics rows batches time thr_rows thr_bytes
         for ((pi = 0; pi < TOTAL_PATCHES; pi++)); do
             test_id="patch$(printf '%02d' $((pi+1)))"
             patch_name="$(basename "${PATCH_FILES[$pi]}" .patch)"
@@ -362,7 +388,7 @@ write_perftests_md() {
             if [[ -f "$RESULTS_DIR/${test_id}_status" ]]; then
                 echo "### Patch $((pi+1)): $patch_name"
                 echo ""
-                echo "**Cumulative patches applied:** $(seq 1 $((pi+1)) | while read n; do printf "P%s" "$n"; done | sed 's/P/, P/g; s/^, //')"
+                echo "**Cumulative patches:** 01 through $(printf '%02d' $((pi+1)))"
                 echo "**Completed:** $(cat "$RESULTS_DIR/${test_id}_completed" 2>/dev/null || echo "N/A")"
                 echo "**Wall-clock time:** $(cat "$RESULTS_DIR/${test_id}_wallclock" 2>/dev/null || echo "N/A")s"
                 echo ""
@@ -385,13 +411,18 @@ write_perftests_md() {
         echo "---"
         echo "*Generated by \`run-perf-suite.sh\` on $(date -u '+%Y-%m-%d %H:%M:%S UTC')*"
 
-    } > "$OUTPUT_FILE"
+    } > "$tmp_file"
+
+    # Atomic rename — if this succeeds, the output file is always complete.
+    # If the script is killed before this point, the previous PERFTESTS.md
+    # (from the last successful write) remains intact.
+    mv -f "$tmp_file" "$OUTPUT_FILE"
 }
 
 # ----- run baseline -----
 if [[ "$SKIP_BASELINE" == false ]]; then
     run_perf_test "Baseline (no patches) @ $COMMIT_SHORT" "baseline"
-    write_perftests_md
+    write_perftests_md || echo "  ⚠️  Warning: failed to update $OUTPUT_FILE"
     echo "  → $OUTPUT_FILE updated"
 fi
 
@@ -412,7 +443,8 @@ for ((i = 0; i < TOTAL_PATCHES; i++)); do
             if ! patch -p1 --fuzz=3 < "$patch_file" 2>/dev/null; then
                 echo "  ❌ Patch $patch_name FAILED to apply. Skipping."
                 echo "PATCH_FAILED" > "$RESULTS_DIR/patch$(printf '%02d' $((i+1)))_status"
-                write_perftests_md
+                date -u '+%Y-%m-%d %H:%M:%S UTC' > "$RESULTS_DIR/patch$(printf '%02d' $((i+1)))_completed"
+                write_perftests_md || echo "  ⚠️  Warning: failed to update $OUTPUT_FILE"
                 echo "  → $OUTPUT_FILE updated"
                 continue
             fi
@@ -421,7 +453,8 @@ for ((i = 0; i < TOTAL_PATCHES; i++)); do
         if ! git apply "$patch_file"; then
             echo "  ❌ Patch $patch_name FAILED to apply (apply after successful check). Skipping."
             echo "PATCH_FAILED" > "$RESULTS_DIR/patch$(printf '%02d' $((i+1)))_status"
-            write_perftests_md
+            date -u '+%Y-%m-%d %H:%M:%S UTC' > "$RESULTS_DIR/patch$(printf '%02d' $((i+1)))_completed"
+            write_perftests_md || echo "  ⚠️  Warning: failed to update $OUTPUT_FILE"
             echo "  → $OUTPUT_FILE updated"
             continue
         fi
@@ -430,9 +463,11 @@ for ((i = 0; i < TOTAL_PATCHES; i++)); do
     echo "  Patch applied."
 
     run_perf_test "Patch $((i+1)): $patch_name (cumulative) @ $COMMIT_SHORT" "patch$(printf '%02d' $((i+1)))"
-    write_perftests_md
+    write_perftests_md || echo "  ⚠️  Warning: failed to update $OUTPUT_FILE"
     echo "  → $OUTPUT_FILE updated"
 done
+
+SUITE_COMPLETED=true
 
 echo ""
 echo "Done! 🎉"

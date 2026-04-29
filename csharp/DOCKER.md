@@ -257,8 +257,7 @@ git worktree remove /tmp/bq-old
 
 ## Stacked Patch Performance Suite
 
-The `patches/` directory contains 10 performance patches (one per documented bottleneck
-in `BOTTLENECKS.md`). The `scripts/run-perf-suite.sh` script applies them incrementally
+The `patches/` directory contains 16 performance patches. The `scripts/run-perf-suite.sh` script applies them incrementally
 and measures the cumulative impact.
 
 ### Quick start
@@ -271,7 +270,7 @@ cd csharp/
 This will:
 1. Create a git worktree at HEAD
 2. Run a baseline perf test (no patches)
-3. Apply patches 01–10 one at a time, running perf tests after each
+3. Apply patches 01–16 one at a time, running perf tests after each
 4. Generate `PERFTESTS.md` with a summary table and detailed results
 
 ### Options
@@ -314,15 +313,21 @@ To benchmark any arbitrary commit without the patch suite:
 
 ### Patch order
 
-| # | File | Bottleneck |
+| # | File | Description |
 |---|------|-----------|
-| 1 | `01-fix-pattern-to-regex.patch` | #7 PatternToRegEx metacharacter escaping |
-| 2 | `02-parameterized-metadata-queries.patch` | #8 Parameterized SQL for metadata |
-| 3 | `03-retry-wallclock-timeout.patch` | #10 Wall-clock retry budget |
-| 4 | `04-persist-detected-project-id.patch` | #3 Persist detected project ID |
-| 5 | `05-skip-credential-recreation.patch` | #4 Skip redundant credential creation |
-| 6 | `06-reuse-grpc-channel.patch` | #5 Avoid gRPC client rebuild |
-| 7 | `07-async-first-execute.patch` | #2 Async-first Execute overrides |
-| 8 | `08-parallel-getobjects.patch` | #6 Parallel GetObjects metadata |
-| 9 | `09-batch-information-schema.patch` | #1 Batch INFORMATION_SCHEMA queries |
-| 10 | `10-reduce-metadata-memory.patch` | #9 Chunked metadata processing |
+| 1 | `01-fix-pattern-to-regex.patch` | PatternToRegEx metacharacter escaping |
+| 2 | `02-parameterized-metadata-queries.patch` | Parameterized SQL for metadata |
+| 3 | `03-retry-wallclock-timeout.patch` | Wall-clock retry budget |
+| 4 | `04-persist-detected-project-id.patch` | Persist detected project ID |
+| 5 | `05-skip-credential-recreation.patch` | Skip redundant credential creation |
+| 6 | `06-reuse-grpc-channel.patch` | Avoid gRPC client rebuild |
+| 7 | `07-async-first-execute.patch` | Async-first Execute overrides |
+| 8 | `08-parallel-getobjects.patch` | Async parallel GetObjects metadata |
+| 9 | `09-batch-information-schema.patch` | Batch INFORMATION_SCHEMA queries |
+| 10 | `10-reduce-metadata-memory.patch` | Streaming chunked metadata |
+| 11 | `11-cache-grpc-channel-per-connection.patch` | Cache gRPC channel per connection |
+| 12 | `12-parallel-getjob-multi-statement.patch` | Parallel GetJob for multi-statement |
+| 13 | `13-fix-sanitize-regex-anchor.patch` | Fix Sanitize regex end-anchor |
+| 14 | `14-fix-httpclient-leak-getaccesstoken.patch` | Fix HttpClient leak in GetAccessToken |
+| 15 | `15-async-dispose-readrowsstream.patch` | Async dispose for ReadRowsStream |
+| 16 | `16-enable-arrow-lz4-compression.patch` | Enable Arrow LZ4 compression |
