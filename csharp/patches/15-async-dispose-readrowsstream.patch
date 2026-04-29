@@ -1,0 +1,64 @@
+From: Performance Patch Series
+Subject: [PATCH 15/16] Add IAsyncDisposable to ReadRowsStream
+
+Bug #15: ReadRowsStream.Dispose() calls
+`this.response?.DisposeAsync().GetAwaiter().GetResult()`, which is
+sync-over-async. While this runs only during cleanup (after
+cancellation) and is not a throughput bottleneck, it is a code quality
+issue that can cause thread-pool starvation under high concurrency.
+
+This patch adds IAsyncDisposable to ReadRowsStream with a proper async
+DisposeAsync() implementation. The sync Dispose() is preserved for
+callers that use synchronous disposal. MultiArrowReader.Dispose is
+updated to prefer DisposeAsync on readers that support it.
+
+---
+diff --git a/csharp/src/BigQueryStatement.cs b/csharp/src/BigQueryStatement.cs
+index 8e73e1f..37cde26 100644
+--- a/csharp/src/BigQueryStatement.cs
++++ b/csharp/src/BigQueryStatement.cs
+@@ -1449,7 +1449,14 @@ namespace AdbcDrivers.BigQuery
+                         try { this.producerTask?.GetAwaiter().GetResult(); } catch { /* producers reported errors via channel */ }
+                         foreach (var reader in this.readerList)
+                         {
+-                            if (reader is IDisposable d) d.Dispose();
++                            if (reader is IAsyncDisposable ad)
++                            {
++                                ad.DisposeAsync().AsTask().GetAwaiter().GetResult();
++                            }
++                            else if (reader is IDisposable d)
++                            {
++                                d.Dispose();
++                            }
+                         }
+                         this.linkedCts.Dispose();
+                         this.concurrencyGate.Dispose();
+@@ -1473,7 +1480,7 @@ namespace AdbcDrivers.BigQuery
+             }
+         }
+ 
+-        sealed class ReadRowsStream : IArrowArrayStream
++        sealed class ReadRowsStream : IArrowArrayStream, IAsyncDisposable
+         {
+             readonly IActivityTracer tracer;
+             readonly TokenProtectedReadClientManger clientMgr;
+@@ -1688,7 +1695,18 @@ namespace AdbcDrivers.BigQuery
+             {
+                 if (!this.disposed)
+                 {
+-                    this.response?.DisposeAsync().GetAwaiter().GetResult();
++                    DisposeAsync().AsTask().GetAwaiter().GetResult();
++                }
++            }
++
++            public async ValueTask DisposeAsync()
++            {
++                if (!this.disposed)
++                {
++                    if (this.response != null)
++                    {
++                        await this.response.DisposeAsync().ConfigureAwait(false);
++                    }
+                     this.disposed = true;
+                 }
+             }

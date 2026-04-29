@@ -1,0 +1,90 @@
+From: Performance Patch Series
+Subject: [PATCH 11/16] Cache gRPC read client at connection level
+
+Bottleneck #11: ExecuteQueryInternalAsync creates a new
+TokenProtectedReadClientManger (and thus a new BigQueryReadClient with
+its own GrpcChannel) on every query execution. Each new channel pays
+TCP + TLS + HTTP/2 establishment on its first RPC (~50-200ms), and the
+previous channel is abandoned for GC finalization, leaking connections.
+
+This is distinct from existing bottleneck #5 (credential-update
+rebuild). Here the issue is that a brand-new client is constructed on
+every single query, regardless of credential state.
+
+The fix moves the TokenProtectedReadClientManger to the connection
+level so it is created once and reused across all queries on that
+connection. The UpdateToken delegate updates the shared instance's
+credential when a token refresh occurs. The connection's Dispose()
+method is updated to clean up the shared client.
+
+---
+ csharp/src/BigQueryConnection.cs | 35 +++---
+ csharp/src/BigQueryStatement.cs  | 35 +++---
+
+diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
+index 68e05a3..d68717e 100644
+--- a/csharp/src/BigQueryConnection.cs
++++ b/csharp/src/BigQueryConnection.cs
+@@ -180,6 +180,8 @@ namespace AdbcDrivers.BigQuery
+ 
+         internal GoogleCredential? Credential { get; private set; }
+ 
++        internal TokenProtectedReadClientManger? ReadClientManager { get; private set; }
++
+         internal int MaxRetryAttempts { get; private set; } = 5;
+ 
+         internal int RetryDelayMs { get; private set; } = 200;
+@@ -407,6 +409,22 @@ namespace AdbcDrivers.BigQuery
+                 }
+ 
+                 Client = client;
++
++                // Create or update the shared gRPC read client
++                if (ReadClientManager == null)
++                {
++                    ReadClientManager = new TokenProtectedReadClientManger(Credential!);
++                    ReadClientManager.UpdateToken = () => Task.Run(() =>
++                    {
++                        SetCredential();
++                        ReadClientManager.UpdateCredential(Credential);
++                    });
++                }
++                else
++                {
++                    ReadClientManager.UpdateCredential(Credential!);
++                }
++
+                 return client;
+             }, ClassName + "." + nameof(Open));
+         }
+@@ -1709,6 +1727,11 @@ namespace AdbcDrivers.BigQuery
+         {
+             Client?.Dispose();
+             Client = null;
++            // The ReadClientManager wraps a BigQueryReadClient (gRPC channel).
++            // We null the reference so it can be garbage-collected; the underlying
++            // gRPC channel will be cleaned up by the finalizer since
++            // BigQueryReadClient does not expose a public Dispose().
++            ReadClientManager = null;
+             this.httpClient?.Dispose();
+             this._fileActivityListener?.Dispose();
+         }
+diff --git a/csharp/src/BigQueryStatement.cs b/csharp/src/BigQueryStatement.cs
+index 331e019..f44f9a9 100644
+--- a/csharp/src/BigQueryStatement.cs
++++ b/csharp/src/BigQueryStatement.cs
+@@ -204,12 +204,8 @@ namespace AdbcDrivers.BigQuery
+ 
+                 BigQueryResults results = await ExecuteWithRetriesAsync(getJobResults, activity, cancellationContext.CancellationToken).ConfigureAwait(false);
+ 
+-                TokenProtectedReadClientManger clientMgr = new TokenProtectedReadClientManger(Credential);
+-                clientMgr.UpdateToken = () => Task.Run(() =>
+-                {
+-                    this.bigQueryConnection.SetCredential();
+-                    clientMgr.UpdateCredential(Credential);
+-                });
++                TokenProtectedReadClientManger clientMgr = this.bigQueryConnection.ReadClientManager
++                    ?? throw new AdbcException("ReadClientManager is not initialized. Ensure the connection is open.", AdbcStatusCode.InvalidState);
+ 
+                 // For multi-statement queries, StatementType == "SCRIPT"
+                 if (results.TableReference == null || job.Statistics.Query.StatementType.Equals("SCRIPT", StringComparison.OrdinalIgnoreCase))

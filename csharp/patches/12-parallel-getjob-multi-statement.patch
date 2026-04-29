@@ -1,0 +1,52 @@
+From: Performance Patch Series
+Subject: [PATCH 12/16] Parallelize GetJob calls in multi-statement path
+
+Bottleneck #12: When a SCRIPT-type multi-statement query is detected,
+the code enumerates child jobs from ListJobs and then calls
+Client.GetJob(job.Reference) sequentially for each one via LINQ
+.Select(). Each GetJob is a separate REST API round-trip, so a
+20-statement script pays 20+ sequential network calls.
+
+This patch replaces the sequential LINQ pipeline with parallel
+GetJobAsync calls using Task.WhenAll. The filtering and ordering are
+then applied to the in-memory results. This reduces the total latency
+from O(N * RTT) to O(RTT) for the GetJob phase.
+
+Since this is inside a local function that is not itself async, we
+convert it to an async local function (getMultiJobResults is already
+declared as returning Task<BigQueryResults>).
+
+---
+diff --git a/csharp/src/BigQueryStatement.cs b/csharp/src/BigQueryStatement.cs
+index f44f9a9..8e73e1f 100644
+--- a/csharp/src/BigQueryStatement.cs
++++ b/csharp/src/BigQueryStatement.cs
+@@ -228,17 +228,22 @@ namespace AdbcDrivers.BigQuery
+                         evaluationKind = evaluationKindString;
+                     }
+ 
+-                    Task<BigQueryResults> getMultiJobResults()
++                    async Task<BigQueryResults> getMultiJobResults()
+                     {
+                         // To get the results of all statements in a multi-statement query, enumerate the child jobs. Related public docs: https://cloud.google.com/bigquery/docs/multi-statement-queries#get_all_executed_statements.
+                         // Can filter by StatementType and EvaluationKind. Related public docs: https://cloud.google.com/bigquery/docs/reference/rest/v2/Job#jobstatistics2, https://cloud.google.com/bigquery/docs/reference/rest/v2/Job#evaluationkind
+                         ListJobsOptions listJobsOptions = new ListJobsOptions();
+                         listJobsOptions.ParentJobId = results.JobReference.JobId;
+-                        var joblist = Client.ListJobs(listJobsOptions)
+-                            .Select(job => Client.GetJob(job.Reference))
+-                            .Where(job => string.IsNullOrEmpty(evaluationKind) || job.Statistics.ScriptStatistics.EvaluationKind.Equals(evaluationKind, StringComparison.OrdinalIgnoreCase))
+-                            .Where(job => string.IsNullOrEmpty(statementType) || job.Statistics.Query.StatementType.Equals(statementType, StringComparison.OrdinalIgnoreCase))
+-                            .OrderBy(job => job.Resource.Statistics.CreationTime)
++
++                        // Fetch all child job details in parallel instead of sequentially
++                        var childJobRefs = Client.ListJobs(listJobsOptions).ToList();
++                        var getJobTasks = childJobRefs.Select(j => Client.GetJobAsync(j.Reference)).ToArray();
++                        BigQueryJob[] allJobs = await Task.WhenAll(getJobTasks).ConfigureAwait(false);
++
++                        var joblist = allJobs
++                            .Where(j => string.IsNullOrEmpty(evaluationKind) || j.Statistics.ScriptStatistics.EvaluationKind.Equals(evaluationKind, StringComparison.OrdinalIgnoreCase))
++                            .Where(j => string.IsNullOrEmpty(statementType) || j.Statistics.Query.StatementType.Equals(statementType, StringComparison.OrdinalIgnoreCase))
++                            .OrderBy(j => j.Resource.Statistics.CreationTime)
+                             .ToList();
+ 
+                         if (joblist.Count > 0)

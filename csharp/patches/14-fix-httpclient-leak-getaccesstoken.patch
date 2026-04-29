@@ -1,0 +1,32 @@
+From: Performance Patch Series
+Subject: [PATCH 14/16] Fix HttpClient leak in GetAccessToken
+
+Bug #14: GetAccessToken creates a local `new HttpClient()` that shadows
+the class-level `this.httpClient` field. The local instance is never
+disposed, which is the well-known .NET HttpClient anti-pattern (socket
+leak, DNS staleness).
+
+The fix reuses the class-level httpClient that is already created in the
+constructor and properly disposed in BigQueryConnection.Dispose().
+
+---
+diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
+index 9557ddf..f027f3f 100644
+--- a/csharp/src/BigQueryConnection.cs
++++ b/csharp/src/BigQueryConnection.cs
+@@ -1771,12 +1771,12 @@ namespace AdbcDrivers.BigQuery
+                 clientSecret,
+                 Uri.EscapeDataString(refreshToken));
+ 
+-            HttpClient httpClient = new HttpClient();
+-
+             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, tokenEndpoint);
+             request.Headers.Add("Accept", "application/json");
+             request.Content = new StringContent(body, Encoding.UTF8, "application/x-www-form-urlencoded");
+-            HttpResponseMessage response = httpClient.SendAsync(request).GetAwaiter().GetResult();
++
++            // Reuse the class-level httpClient instead of creating a new one each call
++            HttpResponseMessage response = this.httpClient.SendAsync(request).GetAwaiter().GetResult();
+             string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+ 
+             BigQueryTokenResponse? bigQueryTokenResponse = JsonSerializer.Deserialize<BigQueryTokenResponse>(responseBody);

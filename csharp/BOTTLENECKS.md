@@ -135,6 +135,23 @@ common case) this code path is not hit.
 `GetJob` is a separate REST API round-trip. A 20-statement script would issue 20+
 sequential REST calls. Limited to SCRIPT queries only.
 
+### 16. Arrow data transfer uses no compression (`BigQueryStatement.cs:742`)
+
+The `CreateReadSession` request builds a `ReadSession` with `DataFormat = DataFormat.Arrow`
+but does not set `ArrowSerializationOptions.BufferCompression`. By default the BigQuery
+Storage API sends Arrow record batches uncompressed over gRPC. For large table imports the
+raw byte volume is the dominant cost on the network path.
+
+Setting `BufferCompression = CompressionCodec.Lz4Frame` tells the server to LZ4-compress
+Arrow buffers before sending. LZ4 frame compression typically achieves 2–4× reduction on
+columnar data while decompressing at ≈4 GB/s on the client — the CPU cost is negligible
+compared to the network savings.
+
+**Impact:** Directly reduces bytes transferred during the data-read phase of
+`MeasureFullTableImport`. Improvement is proportional to data compressibility and
+inversely proportional to available network bandwidth (larger benefit on constrained
+links).
+
 ---
 
 ## Bugs found during audit (not performance bottlenecks)

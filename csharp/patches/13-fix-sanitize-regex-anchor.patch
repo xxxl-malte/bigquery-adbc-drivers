@@ -1,0 +1,26 @@
+From: Performance Patch Series
+Subject: [PATCH 13/16] Fix Sanitize regex to reject trailing invalid content
+
+Bug #13: The sanitizedInputRegex pattern `^[a-zA-Z0-9_-]+` lacks a `$`
+anchor. Because .NET's Regex.IsMatch returns true as soon as any match
+is found, the pattern matches only the valid prefix and silently ignores
+trailing characters. For example, "abc;DROP TABLE x" passes because
+"abc" satisfies the `^` anchor at position 0.
+
+The fix adds the `$` anchor so the entire input must consist only of
+valid characters.
+
+---
+diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
+index d68717e..9557ddf 100644
+--- a/csharp/src/BigQueryConnection.cs
++++ b/csharp/src/BigQueryConnection.cs
+@@ -1736,7 +1736,7 @@ namespace AdbcDrivers.BigQuery
+             this._fileActivityListener?.Dispose();
+         }
+ 
+-        private static Regex sanitizedInputRegex = new Regex("^[a-zA-Z0-9_-]+");
++        private static Regex sanitizedInputRegex = new Regex("^[a-zA-Z0-9_-]+$");
+ 
+         private string Sanitize(string? input)
+         {
