@@ -179,11 +179,15 @@ run_perf_test() {
     local wt_csharp="$WORKTREE_DIR/csharp"
     local output_file="$RESULTS_DIR/${test_id}_output.txt"
 
-    # Clean previous build artifacts (src + perf only, NOT arrow-adbc)
-    # This ensures patches get a fresh build instead of stale incremental results
+    # Clean previous build artifacts (src only + perf binaries, NOT arrow-adbc)
+    # This ensures patches get a fresh build instead of stale incremental results.
+    # We preserve perf/obj because it contains project.assets.json (NuGet restore
+    # metadata). The perf project doesn't change between patches, so its restore
+    # state is stable. Deleting it causes "Could not find project.assets.json"
+    # errors because dotnet build's implicit restore doesn't always recreate it.
     echo "  Cleaning build artifacts..."
     rm -rf "$wt_csharp/src/obj" "$wt_csharp/src/bin"
-    rm -rf "$wt_csharp/perf/obj" "$wt_csharp/perf/bin"
+    rm -rf "$wt_csharp/perf/bin"
     rm -rf "$wt_csharp/artifacts/AdbcDrivers.BigQuery"
     rm -rf "$wt_csharp/artifacts/AdbcDrivers.BigQuery.Perf"
 
@@ -221,7 +225,7 @@ run_perf_test() {
 
     if ! docker run "${docker_common[@]}" \
         "$DOCKER_IMAGE" \
-        dotnet build perf/AdbcDrivers.BigQuery.Perf.csproj -c Release \
+        sh -c "dotnet restore perf/AdbcDrivers.BigQuery.Perf.csproj && dotnet build perf/AdbcDrivers.BigQuery.Perf.csproj -c Release --no-restore" \
         > "$build_file" 2>&1; then
 
         build_end=$(date +%s)
