@@ -58,6 +58,16 @@ namespace AdbcDrivers.BigQuery.Perf
         }
 
         /// <summary>
+        /// Writes to both ITestOutputHelper and Console.Error so output is
+        /// visible in Docker logs regardless of xUnit verbosity settings.
+        /// </summary>
+        private void Log(string message)
+        {
+            _output.WriteLine(message);
+            Console.Error.WriteLine(message);
+        }
+
+        /// <summary>
         /// Reads all rows from the configured BigQuery table using SELECT * and measures
         /// connection time, query execution time, data transfer time, and total time.
         /// </summary>
@@ -66,10 +76,10 @@ namespace AdbcDrivers.BigQuery.Perf
         {
             foreach (PerfTestEnvironment env in _environments)
             {
-                _output.WriteLine("==========================================================");
-                _output.WriteLine($"Environment: {env.Name}");
-                _output.WriteLine($"Table: {env.Catalog}.{env.Schema}.{env.Table}");
-                _output.WriteLine("==========================================================");
+                Log("==========================================================");
+                Log($"Environment: {env.Name}");
+                Log($"Table: {env.Catalog}.{env.Schema}.{env.Table}");
+                Log("==========================================================");
 
                 Stopwatch totalSw = Stopwatch.StartNew();
 
@@ -79,7 +89,7 @@ namespace AdbcDrivers.BigQuery.Perf
                 AdbcDatabase database = new BigQueryDriver().Open(parameters);
                 using AdbcConnection connection = database.Connect(new Dictionary<string, string>());
                 connectSw.Stop();
-                _output.WriteLine($"Connection time: {connectSw.Elapsed}");
+                Log($"Connection time: {connectSw.Elapsed}");
 
                 // Phase 2: Execute query
                 Stopwatch querySw = Stopwatch.StartNew();
@@ -87,11 +97,11 @@ namespace AdbcDrivers.BigQuery.Perf
 
                 string fullyQualifiedTable = $"`{env.Catalog}`.`{env.Schema}`.`{env.Table}`";
                 statement.SqlQuery = $"SELECT * FROM {fullyQualifiedTable}";
-                _output.WriteLine($"Query: {statement.SqlQuery}");
+                Log($"Query: {statement.SqlQuery}");
 
                 QueryResult queryResult = statement.ExecuteQuery();
                 querySw.Stop();
-                _output.WriteLine($"Query execution time: {querySw.Elapsed}");
+                Log($"Query execution time: {querySw.Elapsed}");
 
                 // Phase 3: Read all data
                 Stopwatch readSw = Stopwatch.StartNew();
@@ -108,10 +118,10 @@ namespace AdbcDrivers.BigQuery.Perf
                 {
                     Schema schema = stream.Schema;
                     columnCount = schema.FieldsList.Count;
-                    _output.WriteLine($"Schema: {columnCount} columns");
+                    Log($"Schema: {columnCount} columns");
                     foreach (Field field in schema.FieldsList)
                     {
-                        _output.WriteLine($"  {field.Name}: {field.DataType.TypeId}");
+                        Log($"  {field.Name}: {field.DataType.TypeId}");
                     }
 
                     while (true)
@@ -139,45 +149,45 @@ namespace AdbcDrivers.BigQuery.Perf
                 totalSw.Stop();
 
                 // Results
-                _output.WriteLine("");
-                _output.WriteLine("--- Timing ---");
-                _output.WriteLine($"  Connection:       {connectSw.Elapsed}");
-                _output.WriteLine($"  Query execution:  {querySw.Elapsed}");
-                _output.WriteLine($"  Time to 1st batch:{timeToFirstBatch}");
-                _output.WriteLine($"  Data transfer:    {readSw.Elapsed}");
-                _output.WriteLine($"  Total:            {totalSw.Elapsed}");
+                Log("");
+                Log("--- Timing ---");
+                Log($"  Connection:       {connectSw.Elapsed}");
+                Log($"  Query execution:  {querySw.Elapsed}");
+                Log($"  Time to 1st batch:{timeToFirstBatch}");
+                Log($"  Data transfer:    {readSw.Elapsed}");
+                Log($"  Total:            {totalSw.Elapsed}");
 
-                _output.WriteLine("");
-                _output.WriteLine("--- Volume ---");
-                _output.WriteLine($"  Total rows:       {totalRows:N0}");
-                _output.WriteLine($"  Total batches:    {totalBatches:N0}");
-                _output.WriteLine($"  Columns:          {columnCount}");
-                _output.WriteLine($"  Total bytes (est):{totalBytes:N0} ({FormatBytes(totalBytes)})");
+                Log("");
+                Log("--- Volume ---");
+                Log($"  Total rows:       {totalRows:N0}");
+                Log($"  Total batches:    {totalBatches:N0}");
+                Log($"  Columns:          {columnCount}");
+                Log($"  Total bytes (est):{totalBytes:N0} ({FormatBytes(totalBytes)})");
 
                 if (batchRowCounts.Count > 0)
                 {
-                    _output.WriteLine($"  Avg batch size:   {batchRowCounts.Average():N0} rows");
-                    _output.WriteLine($"  Min batch size:   {batchRowCounts.Min():N0} rows");
-                    _output.WriteLine($"  Max batch size:   {batchRowCounts.Max():N0} rows");
+                    Log($"  Avg batch size:   {batchRowCounts.Average():N0} rows");
+                    Log($"  Min batch size:   {batchRowCounts.Min():N0} rows");
+                    Log($"  Max batch size:   {batchRowCounts.Max():N0} rows");
                 }
 
-                _output.WriteLine("");
-                _output.WriteLine("--- Throughput ---");
+                Log("");
+                Log("--- Throughput ---");
                 double readSeconds = readSw.Elapsed.TotalSeconds;
                 double totalSeconds = totalSw.Elapsed.TotalSeconds;
                 if (readSeconds > 0)
                 {
-                    _output.WriteLine($"  Rows/sec (read):  {totalRows / readSeconds:N0}");
-                    _output.WriteLine($"  Bytes/sec (read): {totalBytes / readSeconds:N0} ({FormatBytes((long)(totalBytes / readSeconds))}/s)");
+                    Log($"  Rows/sec (read):  {totalRows / readSeconds:N0}");
+                    Log($"  Bytes/sec (read): {totalBytes / readSeconds:N0} ({FormatBytes((long)(totalBytes / readSeconds))}/s)");
                 }
                 if (totalSeconds > 0)
                 {
-                    _output.WriteLine($"  Rows/sec (total): {totalRows / totalSeconds:N0}");
-                    _output.WriteLine($"  Bytes/sec (total):{totalBytes / totalSeconds:N0} ({FormatBytes((long)(totalBytes / totalSeconds))}/s)");
+                    Log($"  Rows/sec (total): {totalRows / totalSeconds:N0}");
+                    Log($"  Bytes/sec (total):{totalBytes / totalSeconds:N0} ({FormatBytes((long)(totalBytes / totalSeconds))}/s)");
                 }
 
-                _output.WriteLine("==========================================================");
-                _output.WriteLine("");
+                Log("==========================================================");
+                Log("");
             }
         }
 

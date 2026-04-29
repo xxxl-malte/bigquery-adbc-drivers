@@ -107,6 +107,9 @@ cleanup() {
     echo "Cleaning up worktree..."
     cd "$REPO_ROOT"
     git worktree remove --force "$WORKTREE_DIR" 2>/dev/null || rm -rf "$WORKTREE_DIR"
+    if [[ -n "${RESULTS_DIR:-}" ]] && [[ -d "$RESULTS_DIR" ]]; then
+        rm -rf "$RESULTS_DIR"
+    fi
     echo "Done."
 }
 trap cleanup EXIT
@@ -191,6 +194,7 @@ run_perf_test() {
     if docker run --rm \
         ${env_args[@]+"${env_args[@]}"} \
         ${gcp_cred_args[@]+"${gcp_cred_args[@]}"} \
+        -v nuget-perf-cache:/root/.nuget/packages \
         -e "BIGQUERY_PERF_CONFIG_FILE=/repo/perfconfig.json" \
         -v "$wt_csharp:/repo/csharp" \
         -v "$CONFIG_FILE:/repo/perfconfig.json:ro" \
@@ -205,9 +209,14 @@ run_perf_test() {
         end_time=$(date +%s)
 
         # Verify tests actually ran (exit 0 with 0 tests = nothing executed)
-        if grep -qE "Total tests:\s*0|No test" "$output_file" 2>/dev/null; then
-            echo "  ⚠️  No tests executed (exit 0 but 0 tests found)"
+        if grep -qE "Total tests:.*0[^0-9]" "$output_file" 2>/dev/null && \
+           ! grep -qE "Passed:[[:space:]]*[1-9]" "$output_file" 2>/dev/null; then
+            echo "  ⚠️  No tests executed (exit 0 but 0 tests passed)"
             echo "NO_TESTS" > "$RESULTS_DIR/${test_id}_status"
+        elif grep -qE "Skipped:[[:space:]]*[1-9]" "$output_file" 2>/dev/null && \
+             ! grep -qE "Passed:[[:space:]]*[1-9]" "$output_file" 2>/dev/null; then
+            echo "  ⚠️  Test skipped (missing credentials or config)"
+            echo "SKIPPED" > "$RESULTS_DIR/${test_id}_status"
         else
             echo "  ✅ Test passed ($((end_time - start_time))s)"
             echo "PASSED" > "$RESULTS_DIR/${test_id}_status"
@@ -283,7 +292,11 @@ for ((i = 0; i < TOTAL_PATCHES; i++)); do
             fi
         fi
     else
-        git apply "$patch_file"
+        if ! git apply "$patch_file"; then
+            echo "  ❌ Patch $patch_name FAILED to apply (apply after successful check). Skipping."
+            echo "PATCH_FAILED" > "$RESULTS_DIR/patch$(printf '%02d' $((i+1)))_status"
+            continue
+        fi
     fi
 
     echo "  Patch applied."
@@ -296,6 +309,15 @@ echo ""
 echo "=========================================="
 echo "Generating $OUTPUT_FILE"
 echo "=========================================="
+
+# Helper: choose emoji based on status
+status_emoji() {
+    case "$1" in
+        PASSED)       echo "✅" ;;
+        SKIPPED|NO_TESTS) echo "⚠️" ;;
+        *)            echo "❌" ;;
+    esac
+}
 
 {
     echo "# Performance Test Results"
@@ -314,12 +336,13 @@ echo "=========================================="
     # Baseline row
     if [[ "$SKIP_BASELINE" == false ]]; then
         status=$(cat "$RESULTS_DIR/baseline_status" 2>/dev/null || echo "SKIPPED")
+        emoji=$(status_emoji "$status")
         if [[ "$status" == "PASSED" ]]; then
             metrics=$(parse_test_output "baseline")
             IFS='|' read -r rows batches time thr_rows thr_bytes <<< "$metrics"
-            echo "| 0 | Baseline (no patches) | ✅ $status | $rows | $batches | $time | $thr_rows | $thr_bytes |"
+            echo "| 0 | Baseline (no patches) | $emoji $status | $rows | $batches | $time | $thr_rows | $thr_bytes |"
         else
-            echo "| 0 | Baseline (no patches) | ❌ $status | - | - | - | - | - |"
+            echo "| 0 | Baseline (no patches) | $emoji $status | - | - | - | - | - |"
         fi
     fi
 
@@ -328,13 +351,14 @@ echo "=========================================="
         test_id="patch$(printf '%02d' $((i+1)))"
         patch_name="$(basename "${PATCH_FILES[$i]}" .patch)"
         status=$(cat "$RESULTS_DIR/${test_id}_status" 2>/dev/null || echo "SKIPPED")
+        emoji=$(status_emoji "$status")
 
         if [[ "$status" == "PASSED" ]]; then
             metrics=$(parse_test_output "$test_id")
             IFS='|' read -r rows batches time thr_rows thr_bytes <<< "$metrics"
-            echo "| $((i+1)) | +$patch_name | ✅ $status | $rows | $batches | $time | $thr_rows | $thr_bytes |"
+            echo "| $((i+1)) | +$patch_name | $emoji $status | $rows | $batches | $time | $thr_rows | $thr_bytes |"
         else
-            echo "| $((i+1)) | +$patch_name | ❌ $status | - | - | - | - | - |"
+            echo "| $((i+1)) | +$patch_name | $emoji $status | - | - | - | - | - |"
         fi
     done
 
@@ -365,7 +389,7 @@ echo "=========================================="
 
         echo "### Patch $((i+1)): $patch_name"
         echo ""
-        echo "**Cumulative patches applied:** $(seq -s ", " 1 $((i+1)) | sed 's/[0-9]*/P&/g')"
+        echo "**Cumulative patches applied:** $(seq 1 $((i+1)) | while read n; do printf "P%s" "$n"; done | sed 's/P/, P/g; s/^, //')"
         echo "**Wall-clock time:** $(cat "$RESULTS_DIR/${test_id}_wallclock" 2>/dev/null || echo "N/A")s"
         echo ""
 

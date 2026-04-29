@@ -206,29 +206,48 @@ docker compose run --rm perf-test \
 
 ## Testing an Older Commit
 
-To run tests or benchmarks against a previous version of the code without disturbing
-your working branch, use a [git worktree](https://git-scm.com/docs/git-worktree):
+The simplest way to benchmark an older commit is with the provided script:
+
+```sh
+cd csharp/
+./scripts/run-perf-at-commit.sh \
+  --config perf/perfconfig.json \
+  --commit <sha|tag|branch> \
+  --append-to ./PERFTESTS.md
+```
+
+This handles worktree creation, submodule copying, credential mounting, and cleanup
+automatically. Results print to stdout and optionally append to PERFTESTS.md.
+
+### Manual approach
+
+If you need more control, you can set up a worktree manually:
 
 ```sh
 # 1. Create a worktree checked out at the target commit
-git worktree add /tmp/bq-old <commit-hash>
+git worktree add /tmp/bq-old <commit-hash> --detach
 cd /tmp/bq-old
-git submodule update --init --recursive
 
-# 2. Copy the Docker infrastructure into the old tree
-#    (it may not exist at that commit)
-MAIN=~/Projects/bigquery/csharp
-cp "$MAIN"/{Dockerfile,docker-compose.yml,.dockerignore,.env.sample} \
-   /tmp/bq-old/csharp/
-cp "$MAIN"/.env /tmp/bq-old/csharp/ 2>/dev/null   # only if you have one
-cp -r "$MAIN"/perf /tmp/bq-old/csharp/
+# 2. Copy the submodule (faster than re-cloning)
+cp -R ~/Projects/bigquery/csharp/arrow-adbc /tmp/bq-old/csharp/arrow-adbc
 
-# 3. Build and run
-cd /tmp/bq-old/csharp
-docker compose build test
-docker compose run --rm test
+# 3. Copy perf infrastructure (may not exist at that commit)
+cp -R ~/Projects/bigquery/csharp/perf /tmp/bq-old/csharp/perf
 
-# 4. Clean up when done
+# 4. Run via Docker volume mount
+docker run --rm \
+  -e "BIGQUERY_PERF_CONFIG_FILE=/repo/perfconfig.json" \
+  -e "GOOGLE_APPLICATION_CREDENTIALS=/repo/gcp-credentials.json" \
+  -v "/tmp/bq-old/csharp:/repo/csharp" \
+  -v "$PWD/perf/perfconfig.json:/repo/perfconfig.json:ro" \
+  -v "$HOME/.config/gcloud/application_default_credentials.json:/repo/gcp-credentials.json:ro" \
+  -w /repo/csharp \
+  mcr.microsoft.com/dotnet/sdk:8.0 \
+  dotnet test perf/AdbcDrivers.BigQuery.Perf.csproj -c Release \
+    --logger "console;verbosity=detailed" \
+    --filter "FullyQualifiedName=AdbcDrivers.BigQuery.Perf.FullTableImportTest.MeasureFullTableImport"
+
+# 5. Clean up
 cd ~/Projects/bigquery
 git worktree remove /tmp/bq-old
 ```
@@ -263,8 +282,23 @@ This will:
 --patches DIR       Patch directory (default: ./patches)
 --output PATH       Output file (default: ./PERFTESTS.md)
 --skip-baseline     Skip the baseline run
---only N            Only run up to patch N
+--only N            Only run up to patch N (0 = baseline only)
 --env-file PATH     Path to .env file (default: ./.env)
+--image NAME        Docker SDK image (default: mcr.microsoft.com/dotnet/sdk:8.0)
+```
+
+### Credential handling
+
+Both scripts automatically mount GCP credentials into the Docker container:
+
+1. If `GOOGLE_APPLICATION_CREDENTIALS` env var is set and points to a file, that file is mounted
+2. Otherwise, `~/.config/gcloud/application_default_credentials.json` is used if it exists
+3. If your `perfconfig.json` has inline `jsonCredential`, no file mount is needed
+
+To set up ADC credentials:
+
+```sh
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/bigquery
 ```
 
 ### Running a single commit
