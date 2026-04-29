@@ -164,6 +164,16 @@ rm -rf "$WT_CSHARP/perf"
 cp -R "$CSHARP_DIR/perf" "$WT_CSHARP/perf"
 echo "  Copied: perf/"
 
+# ----- purge host build artifacts from worktree -----
+# cp -R copies obj/bin directories that contain host-specific paths
+# (e.g., /Users/.../. nuget/packages). These are invalid inside the Docker
+# container. Remove ALL obj/bin once; the first dotnet restore will recreate
+# them with correct container paths. Subsequent per-run cleanups only touch
+# src/obj+bin and perf/bin (things that change between patches).
+echo "Cleaning host build artifacts from worktree..."
+find "$WT_CSHARP" -type d \( -name obj -o -name bin \) -exec rm -rf {} + 2>/dev/null || true
+echo "  Done."
+
 # ----- helper: run one perf test -----
 RESULTS_DIR="$(mktemp -d)"
 
