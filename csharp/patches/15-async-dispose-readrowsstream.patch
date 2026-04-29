@@ -10,11 +10,8 @@ GetAwaiter().GetResult() to reduce sync-over-async risk.
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 
 ---
- csharp/src/BigQueryStatement.cs | 76 +++++++++++++++++++++++++++++++++++------
- 1 file changed, 65 insertions(+), 11 deletions(-)
-
 diff --git a/csharp/src/BigQueryStatement.cs b/csharp/src/BigQueryStatement.cs
-index 8e73e1f..14c4c44 100644
+index 4850d5b..fa588be 100644
 --- a/csharp/src/BigQueryStatement.cs
 +++ b/csharp/src/BigQueryStatement.cs
 @@ -1292,7 +1292,7 @@ namespace AdbcDrivers.BigQuery
@@ -35,7 +32,7 @@ index 8e73e1f..14c4c44 100644
  
              public MultiArrowReader(BigQueryStatement statement, Schema schema, IEnumerable<IArrowReader> readers, CancellationContext cancellationContext, int maxConcurrency = 0) : base(statement)
              {
-@@ -1443,24 +1443,64 @@ namespace AdbcDrivers.BigQuery
+@@ -1478,24 +1478,65 @@ namespace AdbcDrivers.BigQuery
              {
                  if (disposing)
                  {
@@ -100,10 +97,11 @@ index 8e73e1f..14c4c44 100644
 +                GC.SuppressFinalize(this);
 +            }
 +
++
              private static void InterlockedMax(ref long location, long value)
              {
                  long current = Interlocked.Read(ref location);
-@@ -1473,7 +1513,7 @@ namespace AdbcDrivers.BigQuery
+@@ -1508,7 +1549,7 @@ namespace AdbcDrivers.BigQuery
              }
          }
  
@@ -112,16 +110,16 @@ index 8e73e1f..14c4c44 100644
          {
              readonly IActivityTracer tracer;
              readonly TokenProtectedReadClientManger clientMgr;
-@@ -1485,7 +1525,7 @@ namespace AdbcDrivers.BigQuery
+@@ -1520,7 +1561,7 @@ namespace AdbcDrivers.BigQuery
              IAsyncEnumerator<ReadRowsResponse>? response;
              long rowsRead;
              bool initialized;
 -            bool disposed;
 +            int _disposed;
  
-             public ReadRowsStream(IActivityTracer tracer, TokenProtectedReadClientManger clientMgr, string streamName, int maxRetries, int initialDelayMs, CancellationToken cancellationToken)
-             {
-@@ -1541,7 +1581,7 @@ namespace AdbcDrivers.BigQuery
+             // Throttle tracking — updated on every batch from ThrottleState
+             int maxThrottlePercent;
+@@ -1600,7 +1641,7 @@ namespace AdbcDrivers.BigQuery
              {
                  return await this.tracer.TraceActivityAsync(async activity =>
                  {
@@ -130,15 +128,13 @@ index 8e73e1f..14c4c44 100644
                      {
                          return false;
                      }
-@@ -1686,10 +1726,24 @@ namespace AdbcDrivers.BigQuery
+@@ -1745,10 +1786,24 @@ namespace AdbcDrivers.BigQuery
  
              public void Dispose()
              {
 -                if (!this.disposed)
 +                if (Interlocked.Exchange(ref _disposed, 1) == 0)
-                 {
--                    this.response?.DisposeAsync().GetAwaiter().GetResult();
--                    this.disposed = true;
++                {
 +                    if (this.response != null)
 +                    {
 +                        // Best-effort sync dispose — fire and forget
@@ -150,7 +146,9 @@ index 8e73e1f..14c4c44 100644
 +            public async ValueTask DisposeAsync()
 +            {
 +                if (Interlocked.Exchange(ref _disposed, 1) == 0)
-+                {
+                 {
+-                    this.response?.DisposeAsync().GetAwaiter().GetResult();
+-                    this.disposed = true;
 +                    if (this.response != null)
 +                    {
 +                        await this.response.DisposeAsync().ConfigureAwait(false);

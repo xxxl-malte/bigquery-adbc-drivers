@@ -120,7 +120,7 @@ index 41eac78..8182df5 100644
 +    internal class ChunkedGetObjectsStream : IArrowArrayStream
 +    {
 +        private readonly BigQueryConnection _connection;
-+        private readonly GetObjectsDepth _depth;
++        private readonly AdbcConnection.GetObjectsDepth _depth;
 +        private readonly string? _dbSchemaPattern;
 +        private readonly string? _tableNamePattern;
 +        private readonly IReadOnlyList<string>? _tableTypes;
@@ -130,7 +130,7 @@ index 41eac78..8182df5 100644
 +
 +        public ChunkedGetObjectsStream(
 +            BigQueryConnection connection,
-+            GetObjectsDepth depth,
++            AdbcConnection.GetObjectsDepth depth,
 +            List<string> catalogIds,
 +            string? dbSchemaPattern,
 +            string? tableNamePattern,
@@ -161,7 +161,7 @@ index 41eac78..8182df5 100644
 +            catalogNameBuilder.Append(catalogId);
 +
 +            StructArray dbSchemas;
-+            if (_depth == GetObjectsDepth.Catalogs)
++            if (_depth == AdbcConnection.GetObjectsDepth.Catalogs)
 +            {
 +                dbSchemas = new StructArray(
 +                    new StructType(StandardSchemas.DbSchemaSchema),
