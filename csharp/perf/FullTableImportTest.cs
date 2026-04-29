@@ -275,7 +275,7 @@ namespace AdbcDrivers.BigQuery.Perf
             {
                 case "service":
                     parameters["adbc.bigquery.auth_type"] = "service";
-                    parameters["adbc.bigquery.auth_json_credential"] = env.JsonCredential ?? "";
+                    parameters["adbc.bigquery.auth_json_credential"] = ResolveJsonCredential(env.JsonCredential);
                     break;
                 case "user":
                     parameters["adbc.bigquery.auth_type"] = "user";
@@ -288,6 +288,16 @@ namespace AdbcDrivers.BigQuery.Perf
                     {
                         parameters["adbc.bigquery.auth_type"] = "service";
                         parameters["adbc.bigquery.auth_json_credential"] = env.JsonCredential!;
+                    }
+                    else
+                    {
+                        // Fall back to GOOGLE_APPLICATION_CREDENTIALS
+                        string? resolved = ResolveJsonCredential(null);
+                        if (!string.IsNullOrEmpty(resolved))
+                        {
+                            parameters["adbc.bigquery.auth_type"] = "service";
+                            parameters["adbc.bigquery.auth_json_credential"] = resolved;
+                        }
                     }
                     break;
             }
@@ -314,6 +324,24 @@ namespace AdbcDrivers.BigQuery.Perf
             }
 
             return parameters;
+        }
+
+        /// <summary>
+        /// Resolves the JSON credential string. If the provided value is null/empty,
+        /// falls back to reading the file pointed to by GOOGLE_APPLICATION_CREDENTIALS.
+        /// </summary>
+        private static string ResolveJsonCredential(string? jsonCredential)
+        {
+            if (!string.IsNullOrEmpty(jsonCredential))
+                return jsonCredential!;
+
+            string? credPath = Environment.GetEnvironmentVariable("GOOGLE_APPLICATION_CREDENTIALS");
+            if (!string.IsNullOrEmpty(credPath) && File.Exists(credPath))
+                return File.ReadAllText(credPath);
+
+            throw new InvalidOperationException(
+                "No JSON credential provided in config and GOOGLE_APPLICATION_CREDENTIALS " +
+                "environment variable is not set or file does not exist.");
         }
 
         /// <summary>

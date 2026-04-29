@@ -157,39 +157,40 @@ run_perf_test() {
 
     local wt_csharp="$WORKTREE_DIR/csharp"
     local output_file="$RESULTS_DIR/${test_id}_output.txt"
-    local build_log="$RESULTS_DIR/${test_id}_build.log"
 
-    # Restore + build inside Docker via volume mount
-    echo "  Restoring & building..."
-    if ! docker run --rm \
-        -v "$wt_csharp:/repo/csharp" \
-        -w /repo/csharp \
-        "$DOCKER_IMAGE" \
-        sh -c "dotnet build perf/AdbcDrivers.BigQuery.Perf.csproj -c Release" \
-        > "$build_log" 2>&1; then
+    # Clean previous build artifacts (src + perf only, NOT arrow-adbc)
+    # This ensures patches get a fresh build instead of stale incremental results
+    echo "  Cleaning build artifacts..."
+    rm -rf "$wt_csharp/src/obj" "$wt_csharp/src/bin"
+    rm -rf "$wt_csharp/perf/obj" "$wt_csharp/perf/bin"
+    rm -rf "$wt_csharp/artifacts/AdbcDrivers.BigQuery"
+    rm -rf "$wt_csharp/artifacts/AdbcDrivers.BigQuery.Perf"
 
-        echo "  ❌ Build FAILED for $label"
-        echo "BUILD_FAILED" > "$RESULTS_DIR/${test_id}_status"
-        echo "0" > "$RESULTS_DIR/${test_id}_wallclock"
-        echo ""
-        tail -20 "$build_log"
-        return 1
-    fi
-
-    echo "  Build succeeded. Running perf test..."
-
-    # Prepare env args
+    # Prepare volume mounts and env args
     local env_args=()
     if [[ -f "$ENV_FILE" ]]; then
         env_args+=(--env-file "$ENV_FILE")
     fi
 
-    # Run the perf test
+    # Mount GCP credentials if available (for Application Default Credentials)
+    local gcp_cred_args=()
+    if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
+        gcp_cred_args+=(-v "$GOOGLE_APPLICATION_CREDENTIALS:/repo/gcp-credentials.json:ro")
+        gcp_cred_args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/repo/gcp-credentials.json")
+    elif [[ -f "$HOME/.config/gcloud/application_default_credentials.json" ]]; then
+        gcp_cred_args+=(-v "$HOME/.config/gcloud/application_default_credentials.json:/repo/gcp-credentials.json:ro")
+        gcp_cred_args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/repo/gcp-credentials.json")
+    fi
+
+    # Run build + test in a single docker invocation
+    # (no --no-build: ensures dotnet test knows the correct output path)
+    echo "  Building & running perf test..."
     local start_time end_time
     start_time=$(date +%s)
 
     if docker run --rm \
         ${env_args[@]+"${env_args[@]}"} \
+        ${gcp_cred_args[@]+"${gcp_cred_args[@]}"} \
         -e "BIGQUERY_PERF_CONFIG_FILE=/repo/perfconfig.json" \
         -v "$wt_csharp:/repo/csharp" \
         -v "$CONFIG_FILE:/repo/perfconfig.json:ro" \
@@ -197,56 +198,63 @@ run_perf_test() {
         "$DOCKER_IMAGE" \
         dotnet test perf/AdbcDrivers.BigQuery.Perf.csproj \
             -c Release \
-            --no-build \
             --logger "console;verbosity=detailed" \
-            --filter "FullyQualifiedName~MeasureFullTableImport" \
+            --filter "FullyQualifiedName=AdbcDrivers.BigQuery.Perf.FullTableImportTest.MeasureFullTableImport" \
         > "$output_file" 2>&1; then
 
         end_time=$(date +%s)
-        echo "  ✅ Test passed ($((end_time - start_time))s)"
-        echo "PASSED" > "$RESULTS_DIR/${test_id}_status"
+
+        # Verify tests actually ran (exit 0 with 0 tests = nothing executed)
+        if grep -qE "Total tests:\s*0|No test" "$output_file" 2>/dev/null; then
+            echo "  ⚠️  No tests executed (exit 0 but 0 tests found)"
+            echo "NO_TESTS" > "$RESULTS_DIR/${test_id}_status"
+        else
+            echo "  ✅ Test passed ($((end_time - start_time))s)"
+            echo "PASSED" > "$RESULTS_DIR/${test_id}_status"
+        fi
     else
         end_time=$(date +%s)
-        echo "  ❌ Test FAILED ($((end_time - start_time))s)"
-        echo "FAILED" > "$RESULTS_DIR/${test_id}_status"
+
+        # Distinguish build failure from test failure
+        if grep -qE "Build FAILED|Error\(s\)" "$output_file" 2>/dev/null && \
+           ! grep -qE "Total tests:" "$output_file" 2>/dev/null; then
+            echo "  ❌ Build FAILED for $label"
+            echo "BUILD_FAILED" > "$RESULTS_DIR/${test_id}_status"
+            echo ""
+            tail -20 "$output_file"
+        else
+            echo "  ❌ Test FAILED ($((end_time - start_time))s)"
+            echo "FAILED" > "$RESULTS_DIR/${test_id}_status"
+        fi
     fi
 
     echo "$((end_time - start_time))" > "$RESULTS_DIR/${test_id}_wallclock"
 }
 
 # ----- extract metrics from test output -----
-extract_metric() {
-    local file="$1"
-    local pattern="$2"
-    grep -oE "$pattern[^|]*" "$file" 2>/dev/null | head -1 | sed "s/$pattern//" | xargs || echo "N/A"
-}
-
 parse_test_output() {
     local test_id="$1"
     local output_file="$RESULTS_DIR/${test_id}_output.txt"
 
     if [[ ! -f "$output_file" ]]; then
-        echo "N/A|N/A|N/A|N/A|N/A|N/A"
+        echo "N/A|N/A|N/A|N/A|N/A"
         return
     fi
 
-    # Parse key metrics from the dotnet test console output
+    # Parse metrics from the test's ITestOutputHelper output
+    # Format: "  Total rows:       25,034,075"
     local total_rows total_batches total_time throughput_rows throughput_bytes
-    total_rows=$(grep -oP 'Total rows:\s*\K[\d,]+' "$output_file" 2>/dev/null | head -1 | tr -d ',' || echo "N/A")
-    total_batches=$(grep -oP 'Total batches:\s*\K[\d,]+' "$output_file" 2>/dev/null | head -1 | tr -d ',' || echo "N/A")
-    total_time=$(grep -oP 'Total time:\s*\K[\d.]+' "$output_file" 2>/dev/null | head -1 || echo "N/A")
-    throughput_rows=$(grep -oP 'Throughput:\s*\K[\d,.]+\s*rows/sec' "$output_file" 2>/dev/null | head -1 || echo "N/A")
-    throughput_bytes=$(grep -oP 'Throughput:\s*[\d,.]+\s*rows/sec,\s*\K[\d,.]+\s*[KMGT]?B/sec' "$output_file" 2>/dev/null | head -1 || echo "N/A")
 
-    # Also try to extract from the ITestOutputHelper standard messages
-    if [[ "$total_rows" == "N/A" ]]; then
-        total_rows=$(grep -oP 'rows:\s*\K[\d,]+' "$output_file" 2>/dev/null | head -1 | tr -d ',' || echo "N/A")
-    fi
-    if [[ "$total_time" == "N/A" ]]; then
-        total_time=$(grep -oP '[Tt]otal.*?:\s*\K[\d.]+\s*s' "$output_file" 2>/dev/null | head -1 || echo "N/A")
-    fi
+    total_rows=$(sed -n 's/.*Total rows:[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" | head -1)
+    total_batches=$(sed -n 's/.*Total batches:[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" | head -1)
+    # Total time is in TimeSpan format: "00:47:25.3457848"
+    total_time=$(sed -n 's/.*Total:[[:space:]]*\([0-9.:]*\).*/\1/p' "$output_file" | head -1)
+    # Rows/sec (read): 8,812
+    throughput_rows=$(sed -n 's/.*Rows\/sec (read):[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" | head -1)
+    # Bytes/sec (read): 1,381,763 (1.32 MB/s)
+    throughput_bytes=$(sed -n 's/.*Bytes\/sec (read):[[:space:]]*[0-9,]* (\([^)]*\)).*/\1/p' "$output_file" | head -1)
 
-    echo "${total_rows}|${total_batches}|${total_time}|${throughput_rows}|${throughput_bytes}"
+    echo "${total_rows:-N/A}|${total_batches:-N/A}|${total_time:-N/A}|${throughput_rows:-N/A}|${throughput_bytes:-N/A}"
 }
 
 # ----- run baseline -----

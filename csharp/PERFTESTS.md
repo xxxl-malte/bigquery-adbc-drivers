@@ -1,157 +1,50 @@
 # Performance Test Results
 
-**Commit:** `c55ec0a4ca0aa078f433d7d64e5fd99ba665be0b`
-**Date:** 2026-04-28 22:05:15 UTC
-**Patches:** 10 applied incrementally
+**Commit:** `4693f2c903dc48ee3c3467a8a034b03b6ee79fab`
+**Date:** 2026-04-29 04:56:59 UTC
+**Patches:** 0 applied incrementally
 
 ## Summary
 
 | # | Configuration | Status | Total Rows | Total Batches | Total Time | Throughput (rows/s) | Throughput (bytes/s) |
 |---|--------------|--------|-----------|--------------|------------|--------------------|--------------------|
-| 0 | Baseline (no patches) | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
-| 1 | +01-fix-pattern-to-regex | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
-| 2 | +02-parameterized-metadata-queries | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
-| 3 | +03-retry-wallclock-timeout | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
-| 4 | +04-persist-detected-project-id | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
-| 5 | +05-skip-credential-recreation | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
-| 6 | +06-reuse-grpc-channel | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
-| 7 | +07-async-first-execute | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
-| 8 | +08-parallel-getobjects | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
-| 9 | +09-batch-information-schema | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
-| 10 | +10-reduce-metadata-memory | ✅ PASSED | N/A | N/A | N/A | N/A | N/A |
+| 0 | Baseline (no patches) | ❌ FAILED | - | - | - | - | - |
 
 ## Detailed Results
 
 ### Baseline (no patches)
 
-**Wall-clock time:** 0s
+**Wall-clock time:** 35s
 
 <details>
 <summary>Full test output</summary>
 
 ```
-```
-</details>
+  Determining projects to restore...
+  Restored /repo/csharp/arrow-adbc/csharp/src/Apache.Arrow.Adbc/Apache.Arrow.Adbc.csproj (in 10.23 sec).
+  Restored /repo/csharp/arrow-adbc/csharp/src/Telemetry/Traces/Listeners/Apache.Arrow.Adbc.Telemetry.Traces.Listeners.csproj (in 10.23 sec).
+  Restored /repo/csharp/src/AdbcDrivers.BigQuery.csproj (in 10.23 sec).
+  Restored /repo/csharp/arrow-adbc/csharp/src/Client/Apache.Arrow.Adbc.Client.csproj (in 10.23 sec).
+  Restored /repo/csharp/arrow-adbc/csharp/test/Apache.Arrow.Adbc.Tests/Apache.Arrow.Adbc.Testing.csproj (in 26.75 sec).
+  Restored /repo/csharp/perf/AdbcDrivers.BigQuery.Perf.csproj (in 26.75 sec).
+  Apache.Arrow.Adbc.Telemetry.Traces.Listeners -> /repo/csharp/arrow-adbc/csharp/artifacts/Apache.Arrow.Adbc.Telemetry.Traces.Listeners/Release/net8.0/Apache.Arrow.Adbc.Telemetry.Traces.Listeners.dll
+  Apache.Arrow.Adbc -> /repo/csharp/arrow-adbc/csharp/artifacts/Apache.Arrow.Adbc/Release/net8.0/Apache.Arrow.Adbc.dll
+  Apache.Arrow.Adbc.Client -> /repo/csharp/arrow-adbc/csharp/artifacts/Apache.Arrow.Adbc.Client/Release/net8.0/Apache.Arrow.Adbc.Client.dll
+  AdbcDrivers.BigQuery -> /repo/csharp/artifacts/AdbcDrivers.BigQuery/Release/net8.0/AdbcDrivers.BigQuery.dll
+  Apache.Arrow.Adbc.Testing -> /repo/csharp/arrow-adbc/csharp/artifacts/Apache.Arrow.Adbc.Testing/Release/net8.0/Apache.Arrow.Adbc.Testing.dll
+  AdbcDrivers.BigQuery.Perf -> /repo/csharp/artifacts/AdbcDrivers.BigQuery.Perf/Release/net8.0/AdbcDrivers.BigQuery.Perf.dll
+Test run for /repo/csharp/artifacts/AdbcDrivers.BigQuery.Perf/Release/net8.0/AdbcDrivers.BigQuery.Perf.dll (.NETCoreApp,Version=v8.0)
+VSTest version 17.11.1 (arm64)
 
-### Patch 1: 01-fix-pattern-to-regex
-
-**Cumulative patches applied:** P1,P P
-**Wall-clock time:** 1s
-
-<details>
-<summary>Full test output</summary>
-
-```
-```
-</details>
-
-### Patch 2: 02-parameterized-metadata-queries
-
-**Cumulative patches applied:** P1,P P2,P P
-**Wall-clock time:** 0s
-
-<details>
-<summary>Full test output</summary>
-
-```
-```
-</details>
-
-### Patch 3: 03-retry-wallclock-timeout
-
-**Cumulative patches applied:** P1,P P2,P P3,P P
-**Wall-clock time:** 0s
-
-<details>
-<summary>Full test output</summary>
-
-```
-```
-</details>
-
-### Patch 4: 04-persist-detected-project-id
-
-**Cumulative patches applied:** P1,P P2,P P3,P P4,P P
-**Wall-clock time:** 0s
-
-<details>
-<summary>Full test output</summary>
-
-```
-```
-</details>
-
-### Patch 5: 05-skip-credential-recreation
-
-**Cumulative patches applied:** P1,P P2,P P3,P P4,P P5,P P
-**Wall-clock time:** 0s
-
-<details>
-<summary>Full test output</summary>
-
-```
-```
-</details>
-
-### Patch 6: 06-reuse-grpc-channel
-
-**Cumulative patches applied:** P1,P P2,P P3,P P4,P P5,P P6,P P
-**Wall-clock time:** 1s
-
-<details>
-<summary>Full test output</summary>
-
-```
-```
-</details>
-
-### Patch 7: 07-async-first-execute
-
-**Cumulative patches applied:** P1,P P2,P P3,P P4,P P5,P P6,P P7,P P
-**Wall-clock time:** 1s
-
-<details>
-<summary>Full test output</summary>
-
-```
-```
-</details>
-
-### Patch 8: 08-parallel-getobjects
-
-**Cumulative patches applied:** P1,P P2,P P3,P P4,P P5,P P6,P P7,P P8,P P
-**Wall-clock time:** 0s
-
-<details>
-<summary>Full test output</summary>
-
-```
-```
-</details>
-
-### Patch 9: 09-batch-information-schema
-
-**Cumulative patches applied:** P1,P P2,P P3,P P4,P P5,P P6,P P7,P P8,P P9,P P
-**Wall-clock time:** 0s
-
-<details>
-<summary>Full test output</summary>
-
-```
-```
-</details>
-
-### Patch 10: 10-reduce-metadata-memory
-
-**Cumulative patches applied:** P1,P P2,P P3,P P4,P P5,P P6,P P7,P P8,P P9,P P10,P P
-**Wall-clock time:** 1s
-
-<details>
-<summary>Full test output</summary>
-
-```
+Starting test execution, please wait...
+A total of 1 test files matched the specified pattern.
+/repo/csharp/artifacts/AdbcDrivers.BigQuery.Perf/Release/net8.0/AdbcDrivers.BigQuery.Perf.dll
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.5+1b188a7b0a (64-bit .NET 8.0.26)
+[xUnit.net 00:00:00.05]   Discovering: AdbcDrivers.BigQuery.Perf
+[xUnit.net 00:00:00.07]   Discovered:  AdbcDrivers.BigQuery.Perf
+[xUnit.net 00:00:00.09]   Starting:    AdbcDrivers.BigQuery.Perf
 ```
 </details>
 
 ---
-*Generated by `run-perf-suite.sh` on 2026-04-28 22:05:15 UTC*
+*Generated by `run-perf-suite.sh` on 2026-04-29 04:56:59 UTC*
