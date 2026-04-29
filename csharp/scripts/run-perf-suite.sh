@@ -104,6 +104,11 @@ echo "Creating worktree at $WORKTREE_DIR ..."
 
 cleanup() {
     echo ""
+    # Write final PERFTESTS.md snapshot so no results are lost on interrupt
+    if [[ -n "${RESULTS_DIR:-}" ]] && [[ -d "$RESULTS_DIR" ]]; then
+        write_perftests_md 2>/dev/null || true
+        echo "Results saved to $OUTPUT_FILE"
+    fi
     echo "Cleaning up worktree..."
     cd "$REPO_ROOT"
     git worktree remove --force "$WORKTREE_DIR" 2>/dev/null || rm -rf "$WORKTREE_DIR"
@@ -113,6 +118,7 @@ cleanup() {
     echo "Done."
 }
 trap cleanup EXIT
+trap 'echo ""; echo "Interrupted — stopping suite..."; exit 130' INT
 
 cd "$REPO_ROOT"
 git worktree add "$WORKTREE_DIR" "$COMMIT_SHA" --detach --quiet
@@ -238,6 +244,7 @@ run_perf_test() {
     fi
 
     echo "$((end_time - start_time))" > "$RESULTS_DIR/${test_id}_wallclock"
+    date -u '+%Y-%m-%d %H:%M:%S UTC' > "$RESULTS_DIR/${test_id}_completed"
 }
 
 # ----- extract metrics from test output -----
@@ -266,9 +273,126 @@ parse_test_output() {
     echo "${total_rows:-N/A}|${total_batches:-N/A}|${total_time:-N/A}|${throughput_rows:-N/A}|${throughput_bytes:-N/A}"
 }
 
+# ----- helper: status emoji -----
+status_emoji() {
+    case "$1" in
+        PASSED)            echo "✅" ;;
+        PENDING)           echo "⏳" ;;
+        SKIPPED|NO_TESTS)  echo "⚠️" ;;
+        *)                 echo "❌" ;;
+    esac
+}
+
+# ----- helper: (re)generate PERFTESTS.md from current results -----
+# Called after every test run so the file always reflects the latest state.
+# Tests not yet started appear as ⏳ PENDING.
+write_perftests_md() {
+    {
+        echo "# Performance Test Results"
+        echo ""
+        echo "**Commit:** \`$COMMIT_SHA\`"
+        echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "**Patches:** $TOTAL_PATCHES applied incrementally"
+        echo ""
+
+        # Summary table
+        echo "## Summary"
+        echo ""
+        echo "| # | Configuration | Status | Completed | Total Rows | Total Batches | Total Time | Throughput (rows/s) | Throughput (bytes/s) |"
+        echo "|---|--------------|--------|-----------|-----------|--------------|------------|--------------------|--------------------|"
+
+        # Baseline row
+        if [[ "$SKIP_BASELINE" == false ]]; then
+            status=$(cat "$RESULTS_DIR/baseline_status" 2>/dev/null || echo "PENDING")
+            completed=$(cat "$RESULTS_DIR/baseline_completed" 2>/dev/null || echo "-")
+            emoji=$(status_emoji "$status")
+            if [[ "$status" == "PASSED" ]]; then
+                metrics=$(parse_test_output "baseline")
+                IFS='|' read -r rows batches time thr_rows thr_bytes <<< "$metrics"
+                echo "| 0 | Baseline (no patches) | $emoji $status | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes |"
+            else
+                echo "| 0 | Baseline (no patches) | $emoji $status | $completed | - | - | - | - | - |"
+            fi
+        fi
+
+        # Patch rows
+        for ((i = 0; i < TOTAL_PATCHES; i++)); do
+            test_id="patch$(printf '%02d' $((i+1)))"
+            patch_name="$(basename "${PATCH_FILES[$i]}" .patch)"
+            status=$(cat "$RESULTS_DIR/${test_id}_status" 2>/dev/null || echo "PENDING")
+            completed=$(cat "$RESULTS_DIR/${test_id}_completed" 2>/dev/null || echo "-")
+            emoji=$(status_emoji "$status")
+
+            if [[ "$status" == "PASSED" ]]; then
+                metrics=$(parse_test_output "$test_id")
+                IFS='|' read -r rows batches time thr_rows thr_bytes <<< "$metrics"
+                echo "| $((i+1)) | +$patch_name | $emoji $status | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes |"
+            else
+                echo "| $((i+1)) | +$patch_name | $emoji $status | $completed | - | - | - | - | - |"
+            fi
+        done
+
+        echo ""
+
+        # Detailed sections
+        echo "## Detailed Results"
+        echo ""
+
+        if [[ "$SKIP_BASELINE" == false ]] && [[ -f "$RESULTS_DIR/baseline_output.txt" ]]; then
+            echo "### Baseline (no patches)"
+            echo ""
+            echo "**Completed:** $(cat "$RESULTS_DIR/baseline_completed" 2>/dev/null || echo "N/A")"
+            echo "**Wall-clock time:** $(cat "$RESULTS_DIR/baseline_wallclock" 2>/dev/null || echo "N/A")s"
+            echo ""
+            echo "<details>"
+            echo "<summary>Full test output</summary>"
+            echo ""
+            echo '```'
+            cat "$RESULTS_DIR/baseline_output.txt" 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo "</details>"
+            echo ""
+        fi
+
+        for ((i = 0; i < TOTAL_PATCHES; i++)); do
+            test_id="patch$(printf '%02d' $((i+1)))"
+            patch_name="$(basename "${PATCH_FILES[$i]}" .patch)"
+
+            # Only emit detail section if the test has run
+            if [[ -f "$RESULTS_DIR/${test_id}_status" ]]; then
+                echo "### Patch $((i+1)): $patch_name"
+                echo ""
+                echo "**Cumulative patches applied:** $(seq 1 $((i+1)) | while read n; do printf "P%s" "$n"; done | sed 's/P/, P/g; s/^, //')"
+                echo "**Completed:** $(cat "$RESULTS_DIR/${test_id}_completed" 2>/dev/null || echo "N/A")"
+                echo "**Wall-clock time:** $(cat "$RESULTS_DIR/${test_id}_wallclock" 2>/dev/null || echo "N/A")s"
+                echo ""
+
+                if [[ -f "$RESULTS_DIR/${test_id}_output.txt" ]]; then
+                    echo "<details>"
+                    echo "<summary>Full test output</summary>"
+                    echo ""
+                    echo '```'
+                    cat "$RESULTS_DIR/${test_id}_output.txt"
+                    echo '```'
+                    echo "</details>"
+                else
+                    echo "*No output available.*"
+                fi
+                echo ""
+            fi
+        done
+
+        echo "---"
+        echo "*Generated by \`run-perf-suite.sh\` on $(date -u '+%Y-%m-%d %H:%M:%S UTC')*"
+
+    } > "$OUTPUT_FILE"
+}
+
 # ----- run baseline -----
 if [[ "$SKIP_BASELINE" == false ]]; then
     run_perf_test "Baseline (no patches) @ $COMMIT_SHORT" "baseline"
+    write_perftests_md
+    echo "  → $OUTPUT_FILE updated"
 fi
 
 # ----- run stacked patches -----
@@ -288,6 +412,8 @@ for ((i = 0; i < TOTAL_PATCHES; i++)); do
             if ! patch -p1 --fuzz=3 < "$patch_file" 2>/dev/null; then
                 echo "  ❌ Patch $patch_name FAILED to apply. Skipping."
                 echo "PATCH_FAILED" > "$RESULTS_DIR/patch$(printf '%02d' $((i+1)))_status"
+                write_perftests_md
+                echo "  → $OUTPUT_FILE updated"
                 continue
             fi
         fi
@@ -295,6 +421,8 @@ for ((i = 0; i < TOTAL_PATCHES; i++)); do
         if ! git apply "$patch_file"; then
             echo "  ❌ Patch $patch_name FAILED to apply (apply after successful check). Skipping."
             echo "PATCH_FAILED" > "$RESULTS_DIR/patch$(printf '%02d' $((i+1)))_status"
+            write_perftests_md
+            echo "  → $OUTPUT_FILE updated"
             continue
         fi
     fi
@@ -302,116 +430,9 @@ for ((i = 0; i < TOTAL_PATCHES; i++)); do
     echo "  Patch applied."
 
     run_perf_test "Patch $((i+1)): $patch_name (cumulative) @ $COMMIT_SHORT" "patch$(printf '%02d' $((i+1)))"
+    write_perftests_md
+    echo "  → $OUTPUT_FILE updated"
 done
 
-# ----- generate PERFTESTS.md -----
-echo ""
-echo "=========================================="
-echo "Generating $OUTPUT_FILE"
-echo "=========================================="
-
-# Helper: choose emoji based on status
-status_emoji() {
-    case "$1" in
-        PASSED)       echo "✅" ;;
-        SKIPPED|NO_TESTS) echo "⚠️" ;;
-        *)            echo "❌" ;;
-    esac
-}
-
-{
-    echo "# Performance Test Results"
-    echo ""
-    echo "**Commit:** \`$COMMIT_SHA\`"
-    echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-    echo "**Patches:** $TOTAL_PATCHES applied incrementally"
-    echo ""
-
-    # Summary table
-    echo "## Summary"
-    echo ""
-    echo "| # | Configuration | Status | Total Rows | Total Batches | Total Time | Throughput (rows/s) | Throughput (bytes/s) |"
-    echo "|---|--------------|--------|-----------|--------------|------------|--------------------|--------------------|"
-
-    # Baseline row
-    if [[ "$SKIP_BASELINE" == false ]]; then
-        status=$(cat "$RESULTS_DIR/baseline_status" 2>/dev/null || echo "SKIPPED")
-        emoji=$(status_emoji "$status")
-        if [[ "$status" == "PASSED" ]]; then
-            metrics=$(parse_test_output "baseline")
-            IFS='|' read -r rows batches time thr_rows thr_bytes <<< "$metrics"
-            echo "| 0 | Baseline (no patches) | $emoji $status | $rows | $batches | $time | $thr_rows | $thr_bytes |"
-        else
-            echo "| 0 | Baseline (no patches) | $emoji $status | - | - | - | - | - |"
-        fi
-    fi
-
-    # Patch rows
-    for ((i = 0; i < TOTAL_PATCHES; i++)); do
-        test_id="patch$(printf '%02d' $((i+1)))"
-        patch_name="$(basename "${PATCH_FILES[$i]}" .patch)"
-        status=$(cat "$RESULTS_DIR/${test_id}_status" 2>/dev/null || echo "SKIPPED")
-        emoji=$(status_emoji "$status")
-
-        if [[ "$status" == "PASSED" ]]; then
-            metrics=$(parse_test_output "$test_id")
-            IFS='|' read -r rows batches time thr_rows thr_bytes <<< "$metrics"
-            echo "| $((i+1)) | +$patch_name | $emoji $status | $rows | $batches | $time | $thr_rows | $thr_bytes |"
-        else
-            echo "| $((i+1)) | +$patch_name | $emoji $status | - | - | - | - | - |"
-        fi
-    done
-
-    echo ""
-
-    # Detailed sections
-    echo "## Detailed Results"
-    echo ""
-
-    if [[ "$SKIP_BASELINE" == false ]] && [[ -f "$RESULTS_DIR/baseline_output.txt" ]]; then
-        echo "### Baseline (no patches)"
-        echo ""
-        echo "**Wall-clock time:** $(cat "$RESULTS_DIR/baseline_wallclock" 2>/dev/null || echo "N/A")s"
-        echo ""
-        echo "<details>"
-        echo "<summary>Full test output</summary>"
-        echo ""
-        echo '```'
-        cat "$RESULTS_DIR/baseline_output.txt" 2>/dev/null || echo "(no output)"
-        echo '```'
-        echo "</details>"
-        echo ""
-    fi
-
-    for ((i = 0; i < TOTAL_PATCHES; i++)); do
-        test_id="patch$(printf '%02d' $((i+1)))"
-        patch_name="$(basename "${PATCH_FILES[$i]}" .patch)"
-
-        echo "### Patch $((i+1)): $patch_name"
-        echo ""
-        echo "**Cumulative patches applied:** $(seq 1 $((i+1)) | while read n; do printf "P%s" "$n"; done | sed 's/P/, P/g; s/^, //')"
-        echo "**Wall-clock time:** $(cat "$RESULTS_DIR/${test_id}_wallclock" 2>/dev/null || echo "N/A")s"
-        echo ""
-
-        if [[ -f "$RESULTS_DIR/${test_id}_output.txt" ]]; then
-            echo "<details>"
-            echo "<summary>Full test output</summary>"
-            echo ""
-            echo '```'
-            cat "$RESULTS_DIR/${test_id}_output.txt"
-            echo '```'
-            echo "</details>"
-        else
-            echo "*No output available.*"
-        fi
-        echo ""
-    done
-
-    echo "---"
-    echo "*Generated by \`run-perf-suite.sh\` on $(date -u '+%Y-%m-%d %H:%M:%S UTC')*"
-
-} > "$OUTPUT_FILE"
-
-echo "Results written to $OUTPUT_FILE"
 echo ""
 echo "Done! 🎉"
