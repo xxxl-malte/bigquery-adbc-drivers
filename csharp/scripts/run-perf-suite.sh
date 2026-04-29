@@ -203,23 +203,57 @@ run_perf_test() {
         gcp_cred_args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/repo/gcp-credentials.json")
     fi
 
-    # Run build + test in a single docker invocation
-    # (no --no-build: ensures dotnet test knows the correct output path)
-    echo "  Building & running perf test..."
+    # Common docker args for both build and test containers.
+    # The volume mounts ensure build artifacts persist across containers.
+    local -a docker_common=(
+        --rm
+        ${env_args[@]+"${env_args[@]}"}
+        ${gcp_cred_args[@]+"${gcp_cred_args[@]}"}
+        -v nuget-perf-cache:/root/.nuget/packages
+        -v "$wt_csharp:/repo/csharp"
+        -w /repo/csharp
+    )
+
+    # --- Step 1: Build (NOT counted towards performance measurement) ---
+    echo "  Building..."
+    local build_start build_end build_file="$RESULTS_DIR/${test_id}_build.txt"
+    build_start=$(date +%s)
+
+    if ! docker run "${docker_common[@]}" \
+        "$DOCKER_IMAGE" \
+        dotnet build perf/AdbcDrivers.BigQuery.Perf.csproj -c Release \
+        > "$build_file" 2>&1; then
+
+        build_end=$(date +%s)
+        echo "  ❌ Build FAILED ($((build_end - build_start))s)"
+        echo "BUILD_FAILED" > "$RESULTS_DIR/${test_id}_status"
+        echo "$((build_end - build_start))" > "$RESULTS_DIR/${test_id}_buildtime"
+        echo "0" > "$RESULTS_DIR/${test_id}_wallclock"
+        date -u '+%Y-%m-%d %H:%M:%S UTC' > "$RESULTS_DIR/${test_id}_completed"
+        # Copy build output as main output for error reporting
+        cp "$build_file" "$output_file"
+        echo ""
+        tail -20 "$output_file"
+        return
+    fi
+
+    build_end=$(date +%s)
+    local build_secs=$((build_end - build_start))
+    echo "$build_secs" > "$RESULTS_DIR/${test_id}_buildtime"
+    echo "  Build succeeded (${build_secs}s)"
+
+    # --- Step 2: Run test only (this is the timed performance measurement) ---
+    echo "  Running perf test..."
     local start_time end_time
     start_time=$(date +%s)
 
-    if docker run --rm \
-        ${env_args[@]+"${env_args[@]}"} \
-        ${gcp_cred_args[@]+"${gcp_cred_args[@]}"} \
-        -v nuget-perf-cache:/root/.nuget/packages \
+    if docker run "${docker_common[@]}" \
         -e "BIGQUERY_PERF_CONFIG_FILE=/repo/perfconfig.json" \
-        -v "$wt_csharp:/repo/csharp" \
         -v "$CONFIG_FILE:/repo/perfconfig.json:ro" \
-        -w /repo/csharp \
         "$DOCKER_IMAGE" \
         dotnet test perf/AdbcDrivers.BigQuery.Perf.csproj \
             -c Release \
+            --no-build \
             --logger "console;verbosity=detailed" \
             --filter "FullyQualifiedName=AdbcDrivers.BigQuery.Perf.FullTableImportTest.MeasureFullTableImport" \
         > "$output_file" 2>&1; then
@@ -236,23 +270,13 @@ run_perf_test() {
             echo "  ⚠️  Test skipped (missing credentials or config)"
             echo "SKIPPED" > "$RESULTS_DIR/${test_id}_status"
         else
-            echo "  ✅ Test passed ($((end_time - start_time))s)"
+            echo "  ✅ Test passed (build: ${build_secs}s, test: $((end_time - start_time))s)"
             echo "PASSED" > "$RESULTS_DIR/${test_id}_status"
         fi
     else
         end_time=$(date +%s)
-
-        # Distinguish build failure from test failure
-        if grep -qE "Build FAILED|Error\(s\)" "$output_file" 2>/dev/null && \
-           ! grep -qE "Total tests:" "$output_file" 2>/dev/null; then
-            echo "  ❌ Build FAILED for $label"
-            echo "BUILD_FAILED" > "$RESULTS_DIR/${test_id}_status"
-            echo ""
-            tail -20 "$output_file"
-        else
-            echo "  ❌ Test FAILED ($((end_time - start_time))s)"
-            echo "FAILED" > "$RESULTS_DIR/${test_id}_status"
-        fi
+        echo "  ❌ Test FAILED (build: ${build_secs}s, test: $((end_time - start_time))s)"
+        echo "FAILED" > "$RESULTS_DIR/${test_id}_status"
     fi
 
     echo "$((end_time - start_time))" > "$RESULTS_DIR/${test_id}_wallclock"
@@ -329,21 +353,24 @@ write_perftests_md() {
         # Summary table
         echo "## Summary"
         echo ""
-        echo "| # | Configuration | Status | Completed | Total Rows | Total Batches | Total Time | Throughput (rows/s) | Throughput (bytes/s) | Max Throttle | Avg Throttle |"
-        echo "|---|--------------|--------|-----------|-----------|--------------|------------|--------------------|--------------------|-------------|-------------|"
+        echo "| # | Configuration | Status | Build (s) | Test (s) | Completed | Total Rows | Total Batches | Total Time | Throughput (rows/s) | Throughput (bytes/s) | Max Throttle | Avg Throttle |"
+        echo "|---|--------------|--------|----------|---------|-----------|-----------|--------------|------------|--------------------|--------------------|-------------|-------------|"
 
         # Baseline row
         if [[ "$SKIP_BASELINE" == false ]]; then
             local status completed emoji metrics rows batches time thr_rows thr_bytes
+            local build_time test_time
             status=$(cat "$RESULTS_DIR/baseline_status" 2>/dev/null || echo "PENDING")
             completed=$(cat "$RESULTS_DIR/baseline_completed" 2>/dev/null || echo "-")
+            build_time=$(cat "$RESULTS_DIR/baseline_buildtime" 2>/dev/null || echo "-")
+            test_time=$(cat "$RESULTS_DIR/baseline_wallclock" 2>/dev/null || echo "-")
             emoji=$(status_emoji "$status")
             if [[ "$status" == "PASSED" ]]; then
                 metrics=$(parse_test_output "baseline")
                 IFS='|' read -r rows batches time thr_rows thr_bytes max_thr avg_thr <<< "$metrics"
-                echo "| 0 | Baseline (no patches) | $emoji $status | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes | ${max_thr}% | ${avg_thr}% |"
+                echo "| 0 | Baseline (no patches) | $emoji $status | $build_time | $test_time | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes | ${max_thr}% | ${avg_thr}% |"
             else
-                echo "| 0 | Baseline (no patches) | $emoji $status | $completed | - | - | - | - | - | - | - |"
+                echo "| 0 | Baseline (no patches) | $emoji $status | $build_time | $test_time | $completed | - | - | - | - | - | - | - |"
             fi
         fi
 
@@ -354,14 +381,16 @@ write_perftests_md() {
             patch_name="$(basename "${PATCH_FILES[$pi]}" .patch)"
             status=$(cat "$RESULTS_DIR/${test_id}_status" 2>/dev/null || echo "PENDING")
             completed=$(cat "$RESULTS_DIR/${test_id}_completed" 2>/dev/null || echo "-")
+            build_time=$(cat "$RESULTS_DIR/${test_id}_buildtime" 2>/dev/null || echo "-")
+            test_time=$(cat "$RESULTS_DIR/${test_id}_wallclock" 2>/dev/null || echo "-")
             emoji=$(status_emoji "$status")
 
             if [[ "$status" == "PASSED" ]]; then
                 metrics=$(parse_test_output "$test_id")
                 IFS='|' read -r rows batches time thr_rows thr_bytes max_thr avg_thr <<< "$metrics"
-                echo "| $((pi+1)) | +$patch_name | $emoji $status | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes | ${max_thr}% | ${avg_thr}% |"
+                echo "| $((pi+1)) | +$patch_name | $emoji $status | $build_time | $test_time | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes | ${max_thr}% | ${avg_thr}% |"
             else
-                echo "| $((pi+1)) | +$patch_name | $emoji $status | $completed | - | - | - | - | - | - | - |"
+                echo "| $((pi+1)) | +$patch_name | $emoji $status | $build_time | $test_time | $completed | - | - | - | - | - | - | - |"
             fi
         done
 
@@ -375,7 +404,8 @@ write_perftests_md() {
             echo "### Baseline (no patches)"
             echo ""
             echo "**Completed:** $(cat "$RESULTS_DIR/baseline_completed" 2>/dev/null || echo "N/A")"
-            echo "**Wall-clock time:** $(cat "$RESULTS_DIR/baseline_wallclock" 2>/dev/null || echo "N/A")s"
+            echo "**Build time:** $(cat "$RESULTS_DIR/baseline_buildtime" 2>/dev/null || echo "N/A")s"
+            echo "**Test time:** $(cat "$RESULTS_DIR/baseline_wallclock" 2>/dev/null || echo "N/A")s"
             echo ""
             echo "<details>"
             echo "<summary>Full test output</summary>"
@@ -397,7 +427,8 @@ write_perftests_md() {
                 echo ""
                 echo "**Cumulative patches:** 01 through $(printf '%02d' $((pi+1)))"
                 echo "**Completed:** $(cat "$RESULTS_DIR/${test_id}_completed" 2>/dev/null || echo "N/A")"
-                echo "**Wall-clock time:** $(cat "$RESULTS_DIR/${test_id}_wallclock" 2>/dev/null || echo "N/A")s"
+                echo "**Build time:** $(cat "$RESULTS_DIR/${test_id}_buildtime" 2>/dev/null || echo "N/A")s"
+                echo "**Test time:** $(cat "$RESULTS_DIR/${test_id}_wallclock" 2>/dev/null || echo "N/A")s"
                 echo ""
 
                 if [[ -f "$RESULTS_DIR/${test_id}_output.txt" ]]; then
