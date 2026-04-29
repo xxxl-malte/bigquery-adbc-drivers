@@ -23,6 +23,7 @@
 #   --only N            Only run up to patch N (0 = baseline only)
 #   --env-file PATH     Path to .env file for Docker (default: ./.env)
 #   --image NAME        Docker SDK image (default: mcr.microsoft.com/dotnet/sdk:8.0)
+#   --cooldown SECS     Seconds to wait between test runs to mitigate BQ throttling (default: 60)
 #   --help              Show this help message
 #
 set -euo pipefail
@@ -40,6 +41,7 @@ SKIP_BASELINE=false
 ONLY_UPTO=-1  # -1 means all
 ENV_FILE="$CSHARP_DIR/.env"
 DOCKER_IMAGE="mcr.microsoft.com/dotnet/sdk:8.0"
+COOLDOWN_SECS=60  # seconds to wait between test runs to mitigate BQ throttling
 
 # Track suite state
 SUITE_START_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -56,8 +58,9 @@ while [[ $# -gt 0 ]]; do
         --only)       ONLY_UPTO="$2"; shift 2 ;;
         --env-file)   ENV_FILE="$2"; shift 2 ;;
         --image)      DOCKER_IMAGE="$2"; shift 2 ;;
+        --cooldown)   COOLDOWN_SECS="$2"; shift 2 ;;
         --help)
-            head -30 "$0" | tail -24
+            head -31 "$0" | tail -25
             exit 0
             ;;
         *)
@@ -285,8 +288,11 @@ parse_test_output() {
     throughput_rows=$({ sed -n 's/.*Rows\/sec (read):[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" || true; } | head -1)
     # Bytes/sec (read): 1,381,763 (1.32 MB/s)
     throughput_bytes=$({ sed -n 's/.*Bytes\/sec (read):[[:space:]]*[0-9,]* (\([^)]*\)).*/\1/p' "$output_file" || true; } | head -1)
+    # Throttle stats from the driver's MultiArrowReader
+    max_throttle=$({ sed -n 's/.*Max throttle:[[:space:]]*\([0-9]*\)%.*/\1/p' "$output_file" || true; } | head -1)
+    avg_throttle=$({ sed -n 's/.*Avg throttle:[[:space:]]*\([0-9.]*\)%.*/\1/p' "$output_file" || true; } | head -1)
 
-    echo "${total_rows:-N/A}|${total_batches:-N/A}|${total_time:-N/A}|${throughput_rows:-N/A}|${throughput_bytes:-N/A}"
+    echo "${total_rows:-N/A}|${total_batches:-N/A}|${total_time:-N/A}|${throughput_rows:-N/A}|${throughput_bytes:-N/A}|${max_throttle:-N/A}|${avg_throttle:-N/A}"
 }
 
 # ----- helper: status emoji -----
@@ -317,13 +323,14 @@ write_perftests_md() {
         echo "**Suite started:** $SUITE_START_TIME"
         echo "**Last updated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "**Patches:** $TOTAL_PATCHES applied incrementally"
+        echo "**Cooldown between runs:** ${COOLDOWN_SECS}s"
         echo ""
 
         # Summary table
         echo "## Summary"
         echo ""
-        echo "| # | Configuration | Status | Completed | Total Rows | Total Batches | Total Time | Throughput (rows/s) | Throughput (bytes/s) |"
-        echo "|---|--------------|--------|-----------|-----------|--------------|------------|--------------------|--------------------|"
+        echo "| # | Configuration | Status | Completed | Total Rows | Total Batches | Total Time | Throughput (rows/s) | Throughput (bytes/s) | Max Throttle | Avg Throttle |"
+        echo "|---|--------------|--------|-----------|-----------|--------------|------------|--------------------|--------------------|-------------|-------------|"
 
         # Baseline row
         if [[ "$SKIP_BASELINE" == false ]]; then
@@ -333,10 +340,10 @@ write_perftests_md() {
             emoji=$(status_emoji "$status")
             if [[ "$status" == "PASSED" ]]; then
                 metrics=$(parse_test_output "baseline")
-                IFS='|' read -r rows batches time thr_rows thr_bytes <<< "$metrics"
-                echo "| 0 | Baseline (no patches) | $emoji $status | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes |"
+                IFS='|' read -r rows batches time thr_rows thr_bytes max_thr avg_thr <<< "$metrics"
+                echo "| 0 | Baseline (no patches) | $emoji $status | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes | ${max_thr}% | ${avg_thr}% |"
             else
-                echo "| 0 | Baseline (no patches) | $emoji $status | $completed | - | - | - | - | - |"
+                echo "| 0 | Baseline (no patches) | $emoji $status | $completed | - | - | - | - | - | - | - |"
             fi
         fi
 
@@ -351,10 +358,10 @@ write_perftests_md() {
 
             if [[ "$status" == "PASSED" ]]; then
                 metrics=$(parse_test_output "$test_id")
-                IFS='|' read -r rows batches time thr_rows thr_bytes <<< "$metrics"
-                echo "| $((pi+1)) | +$patch_name | $emoji $status | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes |"
+                IFS='|' read -r rows batches time thr_rows thr_bytes max_thr avg_thr <<< "$metrics"
+                echo "| $((pi+1)) | +$patch_name | $emoji $status | $completed | $rows | $batches | $time | $thr_rows | $thr_bytes | ${max_thr}% | ${avg_thr}% |"
             else
-                echo "| $((pi+1)) | +$patch_name | $emoji $status | $completed | - | - | - | - | - |"
+                echo "| $((pi+1)) | +$patch_name | $emoji $status | $completed | - | - | - | - | - | - | - |"
             fi
         done
 
@@ -419,11 +426,35 @@ write_perftests_md() {
     mv -f "$tmp_file" "$OUTPUT_FILE"
 }
 
+# ----- helper: cooldown between test runs -----
+# Mitigates BigQuery Storage Read API server-side throttling by waiting
+# between consecutive reads. The API dynamically throttles per-connection
+# throughput (via ThrottleState.throttle_percent in ReadRowsResponse) when
+# a project sustains high read volume. A pause lets the throttle dissipate.
+cooldown_between_runs() {
+    if [[ "$COOLDOWN_SECS" -le 0 ]]; then
+        return
+    fi
+    echo ""
+    echo "  ⏳ Cooldown: waiting ${COOLDOWN_SECS}s to mitigate BigQuery throttling..."
+    local remaining=$COOLDOWN_SECS
+    while [[ $remaining -gt 0 ]]; do
+        printf "\r  ⏳ Cooldown: %3ds remaining..." "$remaining"
+        sleep 1
+        remaining=$((remaining - 1))
+    done
+    printf "\r  ✅ Cooldown complete.                    \n"
+}
+
 # ----- run baseline -----
 if [[ "$SKIP_BASELINE" == false ]]; then
     run_perf_test "Baseline (no patches) @ $COMMIT_SHORT" "baseline"
     write_perftests_md || echo "  ⚠️  Warning: failed to update $OUTPUT_FILE"
     echo "  → $OUTPUT_FILE updated"
+    # Cooldown before the first patch run
+    if [[ "$TOTAL_PATCHES" -gt 0 ]]; then
+        cooldown_between_runs
+    fi
 fi
 
 # ----- run stacked patches -----
@@ -465,6 +496,11 @@ for ((i = 0; i < TOTAL_PATCHES; i++)); do
     run_perf_test "Patch $((i+1)): $patch_name (cumulative) @ $COMMIT_SHORT" "patch$(printf '%02d' $((i+1)))"
     write_perftests_md || echo "  ⚠️  Warning: failed to update $OUTPUT_FILE"
     echo "  → $OUTPUT_FILE updated"
+
+    # Cooldown before next patch (skip after the last one)
+    if [[ $((i + 1)) -lt $TOTAL_PATCHES ]]; then
+        cooldown_between_runs
+    fi
 done
 
 SUITE_COMPLETED=true

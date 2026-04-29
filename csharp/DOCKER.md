@@ -271,7 +271,8 @@ This will:
 1. Create a git worktree at HEAD
 2. Run a baseline perf test (no patches)
 3. Apply patches 01–16 one at a time, running perf tests after each
-4. Generate `PERFTESTS.md` with a summary table and detailed results
+4. Wait a cooldown period between runs to mitigate BigQuery throttling
+5. Generate `PERFTESTS.md` with a summary table and detailed results
 
 ### Options
 
@@ -284,7 +285,21 @@ This will:
 --only N            Only run up to patch N (0 = baseline only)
 --env-file PATH     Path to .env file (default: ./.env)
 --image NAME        Docker SDK image (default: mcr.microsoft.com/dotnet/sdk:8.0)
+--cooldown SECS     Seconds to wait between runs (default: 60, 0 to disable)
 ```
+
+### Throttle visibility
+
+The BigQuery Storage Read API dynamically throttles per-connection throughput via
+`ThrottleState.throttle_percent` (0–100) in each `ReadRowsResponse`. The driver now
+tracks and reports these stats after each data transfer:
+
+- **Max throttle** — highest throttle % seen across all batches/streams
+- **Avg throttle** — mean throttle % across all batches
+- **Batches throttled** — count and percentage of batches with non-zero throttle
+
+These appear in the test output and are included in the PERFTESTS.md summary table.
+Use `--cooldown` to add a pause between runs to let throttling dissipate.
 
 ### Credential handling
 

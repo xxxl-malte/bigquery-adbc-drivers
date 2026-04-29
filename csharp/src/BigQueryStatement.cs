@@ -1406,6 +1406,41 @@ namespace AdbcDrivers.BigQuery
                     activity?.AddBigQueryTag("memory.start_bytes", this.memoryAtStart);
                     activity?.AddBigQueryTag("memory.peak_delta_bytes", Interlocked.Read(ref this.peakMemory) - this.memoryAtStart);
                     activity?.AddBigQueryTag("batches.total_read", Interlocked.Read(ref this.totalBatchesRead));
+
+                    // Aggregate throttle stats from all ReadRowsStream instances
+                    int streamCount = 0;
+                    int maxThrottle = 0;
+                    long totalThrottleSum = 0;
+                    int totalThrottledBatches = 0;
+                    int totalStreamBatches = 0;
+
+                    foreach (var reader in this.readerList)
+                    {
+                        if (reader is ReadRowsStream rrs)
+                        {
+                            streamCount++;
+                            if (rrs.MaxThrottlePercent > maxThrottle)
+                                maxThrottle = rrs.MaxThrottlePercent;
+                            totalThrottleSum += rrs.TotalThrottlePercent;
+                            totalThrottledBatches += rrs.ThrottledBatchCount;
+                            totalStreamBatches += rrs.TotalBatchesProcessed;
+                        }
+                    }
+
+                    activity?.AddBigQueryTag("throttle.max_percent", maxThrottle);
+                    activity?.AddBigQueryTag("throttle.throttled_batches", totalThrottledBatches);
+                    activity?.AddBigQueryTag("throttle.total_batches", totalStreamBatches);
+
+                    // Write throttle stats to stderr for perf test visibility
+                    double avgThrottle = totalStreamBatches > 0 ? (double)totalThrottleSum / totalStreamBatches : 0;
+                    double throttledPct = totalStreamBatches > 0 ? 100.0 * totalThrottledBatches / totalStreamBatches : 0;
+                    Console.Error.WriteLine("");
+                    Console.Error.WriteLine("--- Throttle ---");
+                    Console.Error.WriteLine($"  Max throttle:     {maxThrottle}%");
+                    Console.Error.WriteLine($"  Avg throttle:     {avgThrottle:F1}%");
+                    Console.Error.WriteLine($"  Batches throttled:{totalThrottledBatches:N0} / {totalStreamBatches:N0} ({throttledPct:F1}%)");
+                    Console.Error.WriteLine($"  Streams:          {streamCount}");
+
                     return null;
                 }, ClassName + "." + nameof(ReadNextRecordBatchAsync));
             }
@@ -1458,6 +1493,12 @@ namespace AdbcDrivers.BigQuery
             bool initialized;
             bool disposed;
 
+            // Throttle tracking — updated on every batch from ThrottleState
+            int maxThrottlePercent;
+            long totalThrottlePercent;
+            int throttledBatchCount;
+            int totalBatchesProcessed;
+
             public ReadRowsStream(IActivityTracer tracer, TokenProtectedReadClientManger clientMgr, string streamName, int maxRetries, int initialDelayMs, CancellationToken cancellationToken)
             {
                 this.tracer = tracer;
@@ -1470,6 +1511,12 @@ namespace AdbcDrivers.BigQuery
             }
 
             public Schema Schema => this.schema ?? throw new InvalidOperationException("Stream has no rows");
+
+            // Expose throttle stats for aggregation by MultiArrowReader
+            internal int MaxThrottlePercent => this.maxThrottlePercent;
+            internal long TotalThrottlePercent => this.totalThrottlePercent;
+            internal int ThrottledBatchCount => this.throttledBatchCount;
+            internal int TotalBatchesProcessed => this.totalBatchesProcessed;
 
             public async ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken cancellationToken)
             {
@@ -1505,6 +1552,18 @@ namespace AdbcDrivers.BigQuery
 
                 long batchRowCount = this.response!.Current.RowCount;
                 this.rowsRead += batchRowCount;
+
+                // Track server-side throttle state for this batch
+                int throttlePercent = this.response.Current.ThrottleState?.ThrottlePercent ?? 0;
+                this.totalBatchesProcessed++;
+                this.totalThrottlePercent += throttlePercent;
+                if (throttlePercent > 0)
+                {
+                    this.throttledBatchCount++;
+                    if (throttlePercent > this.maxThrottlePercent)
+                        this.maxThrottlePercent = throttlePercent;
+                }
+
                 return ArrowSerializationHelpers.DeserializeRecordBatch(this.schema, this.response.Current.ArrowRecordBatch.SerializedRecordBatch.Memory);
             }
 
