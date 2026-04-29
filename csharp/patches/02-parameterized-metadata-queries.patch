@@ -1,21 +1,9 @@
 From: Performance Patch Series
-Subject: [PATCH 02/10] Use parameterized queries for INFORMATION_SCHEMA
-
-Bottleneck #8: String.Format + Sanitize() is used to build SQL for
-metadata queries. While Sanitize() prevents injection by validating
-input, it uses regex matching on every call and forces string
-concatenation. BigQuery supports parameterized queries which are safer
-and avoid the regex overhead.
-
-Note: BigQuery parameterized queries cannot parameterize table/schema
-identifiers in FROM clauses — only WHERE clause values. The catalog and
-schema names in FROM `{0}`.`{1}`.INFORMATION_SCHEMA.X remain as
-sanitized string interpolation (backtick-quoted identifiers), but
-WHERE clause filter values now use BigQueryParameter.
+Subject: [PATCH 02/16] 02-parameterized-metadata-queries
 
 ---
- csharp/src/BigQueryConnection.cs | 50 ++++++++++++++++++++++---------
- 1 file changed, 35 insertions(+), 15 deletions(-)
+ csharp/src/BigQueryConnection.cs | 55 +++++++++++++++++++++++++---------------
+ 1 file changed, 34 insertions(+), 21 deletions(-)
 
 diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
 index abeef1a..c9e4f22 100644

@@ -1,30 +1,16 @@
 From: Performance Patch Series
-Subject: [PATCH 04/10] Persist detected project ID to avoid re-detection
-
-Bottleneck #3: When no project ID is configured, ValidateOptions() in
-BigQueryStatement detects it by listing projects (an API call). However
-when UpdateClientToken() is called (e.g. on token refresh), it calls
-Open() with no arguments, which resets Client.ProjectId back to the
-DetectProjectId sentinel. The next query then re-detects, wasting an
-API round-trip.
-
-This patch stores the detected project ID back into this.properties
-after the first detection, so subsequent Open() calls find it there
-and skip re-detection.
-
-Also, UpdateClientToken() now passes the current Client.ProjectId to
-Open() directly, preserving the project ID across credential refreshes.
+Subject: [PATCH 04/16] 04-persist-detected-project-id
 
 ---
- csharp/src/BigQueryConnection.cs | 7 ++++++-
- csharp/src/BigQueryStatement.cs  | 3 +++
- 2 files changed, 9 insertions(+), 1 deletion(-)
+ csharp/src/BigQueryConnection.cs | 12 ++++++++++--
+ csharp/src/BigQueryStatement.cs  |  2 ++
+ 2 files changed, 12 insertions(+), 2 deletions(-)
 
 diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
-index d62962f..6179fb2 100644
+index 35998d8..c656ce1 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -686,8 +686,11 @@ namespace AdbcDrivers.BigQuery
+@@ -696,8 +696,11 @@ namespace AdbcDrivers.BigQuery
          /// </summary>
          internal void UpdateClientToken()
          {
@@ -38,7 +24,7 @@ index d62962f..6179fb2 100644
          }
  
          /// <summary>
-@@ -695,6 +698,11 @@ namespace AdbcDrivers.BigQuery
+@@ -705,6 +708,11 @@ namespace AdbcDrivers.BigQuery
          /// </summary>
          public bool TokenRequiresUpdate(Exception ex) => BigQueryUtils.TokenRequiresUpdate(ex);
  

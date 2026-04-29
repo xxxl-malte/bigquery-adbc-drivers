@@ -1,22 +1,14 @@
 From: Performance Patch Series
-Subject: [PATCH 12/16] Parallelize GetJob calls in multi-statement path
+Subject: [PATCH 12/16] 12-parallel-getjob-multi-statement
 
-Bottleneck #12: When a SCRIPT-type multi-statement query is detected,
-the code enumerates child jobs from ListJobs and then calls
-Client.GetJob(job.Reference) sequentially for each one via LINQ
-.Select(). Each GetJob is a separate REST API round-trip, so a
-20-statement script pays 20+ sequential network calls.
+Parallelize GetJob calls for multi-statement queries.
 
-This patch replaces the sequential LINQ pipeline with parallel
-GetJobAsync calls using Task.WhenAll. The filtering and ordering are
-then applied to the in-memory results. This reduces the total latency
-from O(N * RTT) to O(RTT) for the GetJob phase.
-
-Since this is inside a local function that is not itself async, we
-convert it to an async local function (getMultiJobResults is already
-declared as returning Task<BigQueryResults>).
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 
 ---
+ csharp/src/BigQueryStatement.cs | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
 diff --git a/csharp/src/BigQueryStatement.cs b/csharp/src/BigQueryStatement.cs
 index f44f9a9..8e73e1f 100644
 --- a/csharp/src/BigQueryStatement.cs

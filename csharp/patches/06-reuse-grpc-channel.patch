@@ -1,32 +1,12 @@
 From: Performance Patch Series
-Subject: [PATCH 06/10] Thread-safe gRPC client with rebuild guard
-
-Bottleneck #5: TokenProtectedReadClientManger.UpdateCredential() creates
-a new BigQueryReadClientBuilder and calls Build() on every credential
-update, establishing new gRPC channels with TLS + HTTP/2 setup.
-
-The Google Cloud SDK doesn't expose a way to update credentials on an
-existing gRPC client, so a full rebuild is unavoidable when the
-credential truly changes. However, this patch improves the situation:
-
-1. Thread safety: Adds locking around the bigQueryReadClient field.
-   This is required for correctness with patch 08's parallel
-   GetObjects execution, where multiple threads may read the client
-   while a token refresh modifies it.
-
-2. Guard against redundant rebuilds: Tracks the credential reference
-   to skip the expensive Build() when UpdateCredential is called
-   with the same object (happens in some retry paths).
-
-3. Proper resource lifecycle: The old client is kept alive until the
-   new one is ready, preventing NPE races during streaming reads.
+Subject: [PATCH 06/16] 06-reuse-grpc-channel
 
 ---
- csharp/src/TokenProtectedReadClient.cs | 22 ++++++++++++++++------
- 1 file changed, 16 insertions(+), 6 deletions(-)
+ csharp/src/TokenProtectedReadClient.cs | 24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
 
 diff --git a/csharp/src/TokenProtectedReadClient.cs b/csharp/src/TokenProtectedReadClient.cs
-index 0eb2e79..6ae9502 100644
+index 0eb2e79..c47cb58 100644
 --- a/csharp/src/TokenProtectedReadClient.cs
 +++ b/csharp/src/TokenProtectedReadClient.cs
 @@ -33,7 +33,9 @@ namespace AdbcDrivers.BigQuery
@@ -40,7 +20,7 @@ index 0eb2e79..6ae9502 100644
  
          public TokenProtectedReadClientManger(GoogleCredential credential)
          {
-@@ -54,9 +56,16 @@ namespace AdbcDrivers.BigQuery
+@@ -54,9 +56,23 @@ namespace AdbcDrivers.BigQuery
                  throw new ArgumentNullException(nameof(credential));
              }
  
@@ -52,10 +32,17 @@ index 0eb2e79..6ae9502 100644
 +                if (ReferenceEquals(credential, _lastCredential) && bigQueryReadClient != null)
 +                    return;
 +
++                var oldClient = this.bigQueryReadClient;
++
 +                BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder();
 +                readClientBuilder.Credential = credential;
 +                this.bigQueryReadClient = readClientBuilder.Build();
 +                _lastCredential = credential;
++
++                if (oldClient != null)
++                {
++                    _ = oldClient.ShutdownChannelAsync();
++                }
 +            }
          }
  

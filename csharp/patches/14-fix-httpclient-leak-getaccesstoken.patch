@@ -1,20 +1,19 @@
 From: Performance Patch Series
-Subject: [PATCH 14/16] Fix HttpClient leak in GetAccessToken
+Subject: [PATCH 14/16] 14-fix-httpclient-leak-getaccesstoken
 
-Bug #14: GetAccessToken creates a local `new HttpClient()` that shadows
-the class-level `this.httpClient` field. The local instance is never
-disposed, which is the well-known .NET HttpClient anti-pattern (socket
-leak, DNS staleness).
+Fix HttpClient leak in GetAccessToken.
 
-The fix reuses the class-level httpClient that is already created in the
-constructor and properly disposed in BigQueryConnection.Dispose().
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 
 ---
+ csharp/src/BigQueryConnection.cs | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
 diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
-index 9557ddf..f027f3f 100644
+index 78a70ec..073e907 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -1771,12 +1771,12 @@ namespace AdbcDrivers.BigQuery
+@@ -1875,12 +1875,12 @@ namespace AdbcDrivers.BigQuery
                  clientSecret,
                  Uri.EscapeDataString(refreshToken));
  

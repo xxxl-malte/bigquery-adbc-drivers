@@ -1,40 +1,90 @@
 From: Performance Patch Series
-Subject: [PATCH 08/10] Parallelize GetObjects metadata fetching
+Subject: [PATCH 08/16] 08-parallel-getobjects
 
-Bottleneck #6: The GetCatalogs→GetDbSchemas→GetTableSchemas chain
-processes each catalog, dataset, and table sequentially. For a project
-with many datasets or tables, this means each INFORMATION_SCHEMA query
-waits for the previous one to complete.
+Replace Parallel.ForEach with async Task.WhenAll chain.
+Full async chain: GetCatalogsAsync -> GetDbSchemasAsync -> GetTableSchemasAsync
+  -> GetColumnSchemaAsync / GetConstraintSchemaAsync
+  -> GetConstraintColumnNamesAsync / GetConstraintsUsageAsync
+Only one sync-over-async at the top-level GetCatalogs entry point.
+Fixes Bug #4 (thread pool starvation) and Bug #5 (AggregateException wrapping).
 
-This patch parallelizes:
-1. GetDbSchemas: Fetches schemas for all matching catalogs in parallel
-2. GetTableSchemas: Fetches column/constraint metadata for all tables
-   within a dataset in parallel
-
-The outer GetCatalogs loop stays sequential (listing projects is one
-API call), but the inner dataset-level and table-level work fans out
-using Task.WhenAll.
-
-Thread safety: Each parallel task uses its own builders and only writes
-to a ConcurrentBag. Results are merged back in sorted order at the end.
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 
 ---
- csharp/src/BigQueryConnection.cs | 89 +++++++++++++++++++++++---------
- 1 file changed, 64 insertions(+), 25 deletions(-)
+ csharp/src/BigQueryConnection.cs | 145 +++++++++++++++++++++++++++------------
+ 1 file changed, 101 insertions(+), 44 deletions(-)
 
 diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
-index be3377e..ac0a129 100644
+index 38a8e50..d5fa47e 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -22,6 +22,7 @@
- */
+@@ -790,6 +790,35 @@ namespace AdbcDrivers.BigQuery
+             }, ClassName + "." + nameof(ExecuteQuery));
+         }
  
- using System;
-+using System.Collections.Concurrent;
- using System.Collections.Generic;
- using System.Diagnostics;
- using System.Linq;
-@@ -817,22 +818,38 @@ namespace AdbcDrivers.BigQuery
++        private async Task<BigQueryResults?> ExecuteQueryAsync(string sql, IEnumerable<BigQueryParameter>? parameters, QueryOptions? queryOptions = null, GetQueryResultsOptions? resultsOptions = null)
++        {
++            if (Client == null) { Client = Open(); }
++
++            return await this.TraceActivityAsync(async activity =>
++            {
++                try
++                {
++                    activity?.AddConditionalTag(SemanticConventions.Db.Query.Text, sql, IsSafeToTrace);
++                    Task<BigQueryResults> func()
++                    {
++                        return this.TraceActivityAsync(async (activity) =>
++                        {
++                            BigQueryJob job = await Client.CreateQueryJobAsync(sql, parameters ?? Enumerable.Empty<BigQueryParameter>(), queryOptions);
++                            activity?.AddBigQueryTag("job_id", job.Reference.JobId);
++                            return await job.GetQueryResultsAsync(resultsOptions);
++                        }, ClassName + "." + nameof(ExecuteQueryAsync) + "." + nameof(BigQueryJob.GetQueryResultsAsync));
++                    }
++                    BigQueryResults? result = await ExecuteWithRetriesAsync(func, activity);
++
++                    return result;
++                }
++                catch (Exception ex) when (IsUnauthorizedException(ex, out GoogleApiException? googleEx))
++                {
++                    throw new AdbcException(googleEx!.Message, AdbcStatusCode.Unauthorized, ex);
++                }
++            }, ClassName + "." + nameof(ExecuteQueryAsync));
++        }
++
+         internal static bool IsUnauthorizedException(Exception ex, out GoogleApiException? googleEx)
+         {
+             return BigQueryUtils.ContainsException(ex, out googleEx) && googleEx!.Error.Code == (int)System.Net.HttpStatusCode.Unauthorized;
+@@ -803,7 +832,19 @@ namespace AdbcDrivers.BigQuery
+             IReadOnlyList<string>? tableTypes,
+             string? columnNamePattern)
+         {
+-            return this.TraceActivity(activity =>
++            return GetCatalogsAsync(depth, catalogPattern, dbSchemaPattern,
++                tableNamePattern, tableTypes, columnNamePattern).GetAwaiter().GetResult();
++        }
++
++        private async Task<IArrowArray[]> GetCatalogsAsync(
++            GetObjectsDepth depth,
++            string? catalogPattern,
++            string? dbSchemaPattern,
++            string? tableNamePattern,
++            IReadOnlyList<string>? tableTypes,
++            string? columnNamePattern)
++        {
++            return await this.TraceActivityAsync(async activity =>
+             {
+                 StringArray.Builder catalogNameBuilder = new StringArray.Builder();
+                 List<IArrowArray?> catalogDbSchemasValues = new List<IArrowArray?>();
+@@ -817,7 +858,7 @@ namespace AdbcDrivers.BigQuery
+                     return Client?.ListProjects();
+                 });
+ 
+-                catalogs = ExecuteWithRetriesAsync<PagedEnumerable<ProjectList, CloudProject>?>(func, activity).GetAwaiter().GetResult();
++                catalogs = await ExecuteWithRetriesAsync<PagedEnumerable<ProjectList, CloudProject>?>(func, activity);
+ 
+                 if (catalogs != null)
+                 {
+@@ -829,22 +870,37 @@ namespace AdbcDrivers.BigQuery
  
                  projectIds.Sort();
  
@@ -58,13 +108,10 @@ index be3377e..ac0a129 100644
 +                }
 +                else
 +                {
-+                    var schemaResults = new ConcurrentDictionary<string, StructArray>();
-+                    System.Threading.Tasks.Parallel.ForEach(matchingProjectIds, projectId =>
-+                    {
-+                        schemaResults[projectId] = GetDbSchemas(
-+                            depth, projectId, dbSchemaPattern,
-+                            tableNamePattern, tableTypes, columnNamePattern);
-+                    });
++                    // Use Task.WhenAll for parallel async execution instead of Parallel.ForEach
++                    var tasks = matchingProjectIds.Select(projectId =>
++                        GetDbSchemasAsync(depth, projectId, dbSchemaPattern,
++                            tableNamePattern, tableTypes, columnNamePattern)).ToList();
  
 -                        if (depth == GetObjectsDepth.Catalogs)
 -                        {
@@ -76,10 +123,252 @@ index be3377e..ac0a129 100644
 -                                depth, projectId, dbSchemaPattern,
 -                                tableNamePattern, tableTypes, columnNamePattern));
 -                        }
-+                    foreach (string projectId in matchingProjectIds)
++                    StructArray[] results = await Task.WhenAll(tasks);
++
++                    for (int i = 0; i < matchingProjectIds.Count; i++)
 +                    {
-+                        catalogNameBuilder.Append(projectId);
-+                        catalogDbSchemasValues.Add(schemaResults[projectId]);
++                        catalogNameBuilder.Append(matchingProjectIds[i]);
++                        catalogDbSchemasValues.Add(results[i]);
                      }
                  }
  
+@@ -857,10 +913,10 @@ namespace AdbcDrivers.BigQuery
+                 StandardSchemas.GetObjectsSchema.Validate(dataArrays);
+ 
+                 return dataArrays;
+-            }, ClassName + "." + nameof(GetCatalogs));
++            }, ClassName + "." + nameof(GetCatalogsAsync));
+         }
+ 
+-        private StructArray GetDbSchemas(
++        internal async Task<StructArray> GetDbSchemasAsync(
+             GetObjectsDepth depth,
+             string catalog,
+             string? dbSchemaPattern,
+@@ -868,7 +924,7 @@ namespace AdbcDrivers.BigQuery
+             IReadOnlyList<string>? tableTypes,
+             string? columnNamePattern)
+         {
+-            return this.TraceActivity(activity =>
++            return await this.TraceActivityAsync(async activity =>
+             {
+                 StringArray.Builder dbSchemaNameBuilder = new StringArray.Builder();
+                 List<IArrowArray?> dbSchemaTablesValues = new List<IArrowArray?>();
+@@ -883,7 +939,7 @@ namespace AdbcDrivers.BigQuery
+                     return Client?.ListDatasets(catalog);
+                 });
+ 
+-                PagedEnumerable<DatasetList, BigQueryDataset>? schemas = ExecuteWithRetriesAsync<PagedEnumerable<DatasetList, BigQueryDataset>?>(func, activity).GetAwaiter().GetResult();
++                PagedEnumerable<DatasetList, BigQueryDataset>? schemas = await ExecuteWithRetriesAsync<PagedEnumerable<DatasetList, BigQueryDataset>?>(func, activity);
+ 
+                 if (schemas != null)
+                 {
+@@ -901,7 +957,7 @@ namespace AdbcDrivers.BigQuery
+                             }
+                             else
+                             {
+-                                dbSchemaTablesValues.Add(GetTableSchemas(
++                                dbSchemaTablesValues.Add(await GetTableSchemasAsync(
+                                     depth, catalog, schema.Reference.DatasetId,
+                                     tableNamePattern, tableTypes, columnNamePattern));
+                             }
+@@ -921,10 +977,10 @@ namespace AdbcDrivers.BigQuery
+                     length,
+                     dataArrays,
+                     nullBitmapBuffer.Build());
+-            }, ClassName + "." + nameof(GetDbSchemas));
++            }, ClassName + "." + nameof(GetDbSchemasAsync));
+         }
+ 
+-        private StructArray GetTableSchemas(
++        private async Task<StructArray> GetTableSchemasAsync(
+             GetObjectsDepth depth,
+             string catalog,
+             string dbSchema,
+@@ -932,7 +988,7 @@ namespace AdbcDrivers.BigQuery
+             IReadOnlyList<string>? tableTypes,
+             string? columnNamePattern)
+         {
+-            return this.TraceActivity(activity =>
++            return await this.TraceActivityAsync(async activity =>
+             {
+                 StringArray.Builder tableNameBuilder = new StringArray.Builder();
+                 StringArray.Builder tableTypeBuilder = new StringArray.Builder();
+@@ -969,7 +1025,7 @@ namespace AdbcDrivers.BigQuery
+                     }
+                 }
+ 
+-                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams.Count > 0 ? queryParams : null);
++                BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams.Count > 0 ? queryParams : null);
+ 
+                 if (result != null)
+                 {
+@@ -982,15 +1038,16 @@ namespace AdbcDrivers.BigQuery
+ 
+                     foreach (BigQueryRow row in result)
+                     {
+-                        tableNameBuilder.Append(GetValue(row["table_name"]));
++                        string tableName = GetValue(row["table_name"]);
++                        tableNameBuilder.Append(tableName);
+                         tableTypeBuilder.Append(GetValue(row["table_type"]));
+                         nullBitmapBuffer.Append(true);
+                         length++;
+ 
+                         if (depth == GetObjectsDepth.All && includeConstraints)
+                         {
+-                            tableConstraintsValues.Add(GetConstraintSchema(
+-                                depth, catalog, dbSchema, GetValue(row["table_name"]), columnNamePattern));
++                            tableConstraintsValues.Add(await GetConstraintSchemaAsync(
++                                depth, catalog, dbSchema, tableName, columnNamePattern));
+                         }
+                         else
+                         {
+@@ -1003,7 +1060,7 @@ namespace AdbcDrivers.BigQuery
+                         }
+                         else
+                         {
+-                            tableColumnsValues.Add(GetColumnSchema(catalog, dbSchema, GetValue(row["table_name"]), columnNamePattern));
++                            tableColumnsValues.Add(await GetColumnSchemaAsync(catalog, dbSchema, tableName, columnNamePattern));
+                         }
+                     }
+                 }
+@@ -1022,16 +1079,16 @@ namespace AdbcDrivers.BigQuery
+                     length,
+                     dataArrays,
+                     nullBitmapBuffer.Build());
+-            }, ClassName + "." + nameof(GetTableSchemas));
++            }, ClassName + "." + nameof(GetTableSchemasAsync));
+         }
+ 
+-        private StructArray GetColumnSchema(
++        private async Task<StructArray> GetColumnSchemaAsync(
+             string catalog,
+             string dbSchema,
+             string table,
+             string? columnNamePattern)
+         {
+-            return this.TraceActivity(activity =>
++            return await this.TraceActivityAsync(async activity =>
+             {
+                 StringArray.Builder columnNameBuilder = new StringArray.Builder();
+                 Int32Array.Builder ordinalPositionBuilder = new Int32Array.Builder();
+@@ -1065,7 +1122,7 @@ namespace AdbcDrivers.BigQuery
+                     queryParams.Add(new BigQueryParameter("columnNamePattern", BigQueryDbType.String, columnNamePattern));
+                 }
+ 
+-                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
++                BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams);
+ 
+                 if (result != null)
+                 {
+@@ -1140,17 +1197,17 @@ namespace AdbcDrivers.BigQuery
+                     length,
+                     dataArrays,
+                     nullBitmapBuffer.Build());
+-            }, ClassName + "." + nameof(GetColumnSchema));
++            }, ClassName + "." + nameof(GetColumnSchemaAsync));
+         }
+ 
+-        private StructArray GetConstraintSchema(
++        private async Task<StructArray> GetConstraintSchemaAsync(
+             GetObjectsDepth depth,
+             string catalog,
+             string dbSchema,
+             string table,
+             string? columnNamePattern)
+         {
+-            return this.TraceActivity(activity =>
++            return await this.TraceActivityAsync(async activity =>
+             {
+                 StringArray.Builder constraintNameBuilder = new StringArray.Builder();
+                 StringArray.Builder constraintTypeBuilder = new StringArray.Builder();
+@@ -1163,7 +1220,7 @@ namespace AdbcDrivers.BigQuery
+                 List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+                 queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
+ 
+-                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
++                BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams);
+ 
+                 if (result != null)
+                 {
+@@ -1178,11 +1235,11 @@ namespace AdbcDrivers.BigQuery
+ 
+                         if (depth == GetObjectsDepth.All || depth == GetObjectsDepth.Tables)
+                         {
+-                            constraintColumnNamesValues.Add(GetConstraintColumnNames(
++                            constraintColumnNamesValues.Add(await GetConstraintColumnNamesAsync(
+                                 catalog, dbSchema, table, constraintName));
+                             if (constraintType.ToUpper() == "FOREIGN KEY")
+                             {
+-                                constraintColumnUsageValues.Add(GetConstraintsUsage(
++                                constraintColumnUsageValues.Add(await GetConstraintsUsageAsync(
+                                     catalog, dbSchema, table, constraintName));
+                             }
+                             else
+@@ -1213,16 +1270,16 @@ namespace AdbcDrivers.BigQuery
+                     length,
+                     dataArrays,
+                     nullBitmapBuffer.Build());
+-            }, ClassName + "." + nameof(GetConstraintSchema));
++            }, ClassName + "." + nameof(GetConstraintSchemaAsync));
+         }
+ 
+-        private StringArray GetConstraintColumnNames(
++        private async Task<StringArray> GetConstraintColumnNamesAsync(
+             string catalog,
+             string dbSchema,
+             string table,
+             string constraintName)
+         {
+-            return this.TraceActivity(activity =>
++            return await this.TraceActivityAsync(async activity =>
+             {
+                 string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.KEY_COLUMN_USAGE WHERE table_name = @tableName AND constraint_name = @constraintName ORDER BY ordinal_position";
+                 List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+@@ -1231,7 +1288,7 @@ namespace AdbcDrivers.BigQuery
+ 
+                 StringArray.Builder constraintColumnNamesBuilder = new StringArray.Builder();
+ 
+-                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
++                BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams);
+ 
+                 if (result != null)
+                 {
+@@ -1243,16 +1300,16 @@ namespace AdbcDrivers.BigQuery
+                 }
+ 
+                 return constraintColumnNamesBuilder.Build();
+-            }, ClassName + "." + nameof(GetConstraintColumnNames));
++            }, ClassName + "." + nameof(GetConstraintColumnNamesAsync));
+         }
+ 
+-        private StructArray GetConstraintsUsage(
++        private async Task<StructArray> GetConstraintsUsageAsync(
+             string catalog,
+             string dbSchema,
+             string table,
+             string constraintName)
+         {
+-            return this.TraceActivity(activity =>
++            return await this.TraceActivityAsync(async activity =>
+             {
+                 StringArray.Builder constraintFkCatalogBuilder = new StringArray.Builder();
+                 StringArray.Builder constraintFkDbSchemaBuilder = new StringArray.Builder();
+@@ -1265,7 +1322,7 @@ namespace AdbcDrivers.BigQuery
+                 List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+                 queryParams.Add(new BigQueryParameter("constraintName", BigQueryDbType.String, constraintName));
+ 
+-                BigQueryResults? result = ExecuteQuery(query, parameters: queryParams);
++                BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams);
+ 
+                 if (result != null)
+                 {
+@@ -1300,7 +1357,7 @@ namespace AdbcDrivers.BigQuery
+                     length,
+                     dataArrays,
+                     nullBitmapBuffer.Build());
+-            }, ClassName + "." + nameof(GetConstraintsUsage));
++            }, ClassName + "." + nameof(GetConstraintsUsageAsync));
+         }
+ 
+         private string PatternToRegEx(string? pattern)

@@ -1,33 +1,35 @@
 From: Performance Patch Series
-Subject: [PATCH 03/10] Add wall-clock timeout to RetryManager
-
-Bottleneck #10: RetryManager is bounded only by attempt count (5 retries
-= 6 attempts), with exponential backoff from 200ms to 5000ms cap. There
-is no total wall-clock timeout, so if each operation itself is slow, the
-total elapsed time can be unbounded.
-
-This patch:
-1. Adds a totalTimeoutMilliseconds parameter to RetryManager
-2. Adds a new ADBC parameter adbc.bigquery.retry_total_timeout_ms
-3. Adds a RetryTotalTimeoutMs property to BigQueryConnection (default 0 = no limit)
-4. Wires the timeout through the wrapper methods in both Connection and Statement
-
-When set to a positive value, the retry loop checks elapsed time before
-each attempt and aborts if the deadline would be exceeded. The default
-(0) preserves existing behavior.
+Subject: [PATCH 03/16] 03-retry-wallclock-timeout
 
 ---
- csharp/src/RetryManager.cs       | 24 ++++++++++++++++++------
+ csharp/src/BigQueryConnection.cs | 14 +++++++++++++-
  csharp/src/BigQueryParameters.cs |  1 +
- csharp/src/BigQueryConnection.cs | 18 ++++++++++++++++--
  csharp/src/BigQueryStatement.cs  |  4 +++-
- 4 files changed, 38 insertions(+), 9 deletions(-)
+ csharp/src/RetryManager.cs       | 20 +++++++++++++++++++-
+ 4 files changed, 36 insertions(+), 3 deletions(-)
 
 diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
-index c9e4f22..d62962f 100644
+index c9e4f22..35998d8 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -695,7 +695,9 @@ namespace AdbcDrivers.BigQuery
+@@ -125,6 +125,16 @@ namespace AdbcDrivers.BigQuery
+                 throw new ArgumentException($"The value '{sRetryDelay}' for parameter '{BigQueryParameters.RetryDelayMs}' is not a valid non-negative integer.");
+             }
+ 
++            if (this.properties.TryGetValue(BigQueryParameters.RetryTotalTimeoutMs, out string? sTotalTimeout) &&
++                int.TryParse(sTotalTimeout, out int totalTimeout) && totalTimeout >= 0)
++            {
++                RetryTotalTimeoutMs = totalTimeout;
++            }
++            else if (sTotalTimeout != null)
++            {
++                throw new ArgumentException($"The value '{sTotalTimeout}' for parameter '{BigQueryParameters.RetryTotalTimeoutMs}' is not a valid non-negative integer.");
++            }
++
+             if (this.properties.TryGetValue(BigQueryParameters.DefaultClientLocation, out string? location) &&
+                 !string.IsNullOrEmpty(location) &&
+                 BigQueryConstants.ValidLocations.Any(l => l.Equals(location, StringComparison.OrdinalIgnoreCase)))
+@@ -695,7 +705,9 @@ namespace AdbcDrivers.BigQuery
          /// </summary>
          public bool TokenRequiresUpdate(Exception ex) => BigQueryUtils.TokenRequiresUpdate(ex);
  

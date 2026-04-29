@@ -1,45 +1,31 @@
 From: Performance Patch Series
-Subject: [PATCH 09/10] Batch INFORMATION_SCHEMA queries per dataset
+Subject: [PATCH 09/16] 09-batch-information-schema
 
-Bottleneck #1 (N+1 queries): GetColumnSchema and GetConstraintSchema
-issue one INFORMATION_SCHEMA query per table. For a dataset with N
-tables, this produces N+1 queries (1 for TABLES, N for COLUMNS) plus
-additional constraint queries.
+Batch INFORMATION_SCHEMA queries per dataset to avoid N+1 queries.
+BatchFetchColumnsAsync: one query for all columns, grouped by table_name.
+BatchFetchConstraintsAsync: one query for all constraints, grouped by table_name.
+Pre-fetched rows passed via optional prefetchedRows parameter to
+GetColumnSchemaAsync and GetConstraintSchemaAsync (fixes Bug #6).
 
-This patch introduces a batch approach:
-- Fetch ALL columns for the dataset in one query (with optional
-  columnNamePattern filter), then partition results in memory by
-  table_name.
-- Fetch ALL table constraints for the dataset in one query, then
-  partition by table_name.
-- KEY_COLUMN_USAGE and CONSTRAINT_COLUMN_USAGE remain per-constraint
-  queries (few constraints per table makes this acceptable).
-
-This reduces the column query count from O(N) to O(1) per dataset
-and constraint query count from O(N) to O(1) per dataset, which
-dramatically reduces latency for datasets with many tables.
-
-The pre-fetched data is passed to the existing builder methods as
-dictionaries keyed by table name, avoiding changes to the Arrow
-array construction logic.
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 
 ---
- csharp/src/BigQueryConnection.cs | 165 ++++++++++++++++++++++++++-----
- 1 file changed, 140 insertions(+), 25 deletions(-)
+ csharp/src/BigQueryConnection.cs | 140 +++++++++++++++++++++++++++++++++------
+ 1 file changed, 121 insertions(+), 19 deletions(-)
 
 diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
-index ac0a129..37f0cc8 100644
+index d5fa47e..fa80f14 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -929,6 +929,73 @@ namespace AdbcDrivers.BigQuery
-             }, ClassName + "." + nameof(GetDbSchemas));
+@@ -980,6 +980,73 @@ namespace AdbcDrivers.BigQuery
+             }, ClassName + "." + nameof(GetDbSchemasAsync));
          }
  
 +        /// <summary>
 +        /// Fetches all columns for a dataset in a single INFORMATION_SCHEMA query,
 +        /// grouped by table_name. Avoids N+1 per-table queries.
 +        /// </summary>
-+        private Dictionary<string, List<BigQueryRow>> BatchFetchColumns(
++        private async Task<Dictionary<string, List<BigQueryRow>>> BatchFetchColumnsAsync(
 +            string catalog, string dbSchema, string? columnNamePattern)
 +        {
 +            string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.COLUMNS";
@@ -54,7 +40,7 @@ index ac0a129..37f0cc8 100644
 +            query += " ORDER BY table_name, ordinal_position";
 +
 +            var grouped = new Dictionary<string, List<BigQueryRow>>(StringComparer.OrdinalIgnoreCase);
-+            BigQueryResults? result = ExecuteQuery(query, parameters: queryParams.Count > 0 ? queryParams : null);
++            BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams.Count > 0 ? queryParams : null);
 +
 +            if (result != null)
 +            {
@@ -77,13 +63,13 @@ index ac0a129..37f0cc8 100644
 +        /// Fetches all table constraints for a dataset in a single INFORMATION_SCHEMA query,
 +        /// grouped by table_name. Avoids N+1 per-table queries.
 +        /// </summary>
-+        private Dictionary<string, List<BigQueryRow>> BatchFetchConstraints(
++        private async Task<Dictionary<string, List<BigQueryRow>>> BatchFetchConstraintsAsync(
 +            string catalog, string dbSchema)
 +        {
 +            string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS";
 +
 +            var grouped = new Dictionary<string, List<BigQueryRow>>(StringComparer.OrdinalIgnoreCase);
-+            BigQueryResults? result = ExecuteQuery(query, parameters: null);
++            BigQueryResults? result = await ExecuteQueryAsync(query, parameters: null);
 +
 +            if (result != null)
 +            {
@@ -102,42 +88,138 @@ index ac0a129..37f0cc8 100644
 +            return grouped;
 +        }
 +
-         private StructArray GetTableSchemas(
+         private async Task<StructArray> GetTableSchemasAsync(
              GetObjectsDepth depth,
              string catalog,
-@@ -985,9 +1052,16 @@ namespace AdbcDrivers.BigQuery
+@@ -1036,6 +1103,12 @@ namespace AdbcDrivers.BigQuery
                          bool.TryParse(includeConstraintsValue, out includeConstraints);
                      }
  
 +                    // Pre-fetch all columns and constraints for the dataset in batch
 +                    Dictionary<string, List<BigQueryRow>>? batchedColumns =
-+                        (depth != GetObjectsDepth.Tables) ? BatchFetchColumns(catalog, dbSchema, columnNamePattern) : null;
++                        (depth != GetObjectsDepth.Tables) ? await BatchFetchColumnsAsync(catalog, dbSchema, columnNamePattern) : null;
 +                    Dictionary<string, List<BigQueryRow>>? batchedConstraints =
-+                        (depth == GetObjectsDepth.All && includeConstraints) ? BatchFetchConstraints(catalog, dbSchema) : null;
++                        (depth == GetObjectsDepth.All && includeConstraints) ? await BatchFetchConstraintsAsync(catalog, dbSchema) : null;
 +
                      foreach (BigQueryRow row in result)
                      {
--                        tableNameBuilder.Append(GetValue(row["table_name"]));
-+                        string tableName = GetValue(row["table_name"]);
-+                        tableNameBuilder.Append(tableName);
-                         tableTypeBuilder.Append(GetValue(row["table_type"]));
-                         nullBitmapBuffer.Append(true);
-                         length++;
-@@ -995,7 +1069,7 @@ namespace AdbcDrivers.BigQuery
+                         string tableName = GetValue(row["table_name"]);
+@@ -1046,8 +1119,11 @@ namespace AdbcDrivers.BigQuery
+ 
                          if (depth == GetObjectsDepth.All && includeConstraints)
                          {
-                             tableConstraintsValues.Add(GetConstraintSchema(
--                                depth, catalog, dbSchema, GetValue(row["table_name"]), columnNamePattern));
-+                                depth, catalog, dbSchema, tableName, columnNamePattern));
++                            List<BigQueryRow>? prefetchedConstraintRows = null;
++                            batchedConstraints?.TryGetValue(tableName, out prefetchedConstraintRows);
+                             tableConstraintsValues.Add(await GetConstraintSchemaAsync(
+-                                depth, catalog, dbSchema, tableName, columnNamePattern));
++                                depth, catalog, dbSchema, tableName, columnNamePattern,
++                                prefetchedRows: prefetchedConstraintRows));
                          }
                          else
                          {
-@@ -1008,7 +1082,7 @@ namespace AdbcDrivers.BigQuery
+@@ -1060,7 +1136,10 @@ namespace AdbcDrivers.BigQuery
                          }
                          else
                          {
--                            tableColumnsValues.Add(GetColumnSchema(catalog, dbSchema, GetValue(row["table_name"]), columnNamePattern));
-+                            tableColumnsValues.Add(GetColumnSchema(catalog, dbSchema, tableName, columnNamePattern));
+-                            tableColumnsValues.Add(await GetColumnSchemaAsync(catalog, dbSchema, tableName, columnNamePattern));
++                            List<BigQueryRow>? prefetchedColumnRows = null;
++                            batchedColumns?.TryGetValue(tableName, out prefetchedColumnRows);
++                            tableColumnsValues.Add(await GetColumnSchemaAsync(catalog, dbSchema, tableName, columnNamePattern,
++                                prefetchedRows: prefetchedColumnRows));
                          }
                      }
                  }
+@@ -1086,7 +1165,8 @@ namespace AdbcDrivers.BigQuery
+             string catalog,
+             string dbSchema,
+             string table,
+-            string? columnNamePattern)
++            string? columnNamePattern,
++            List<BigQueryRow>? prefetchedRows = null)
+         {
+             return await this.TraceActivityAsync(async activity =>
+             {
+@@ -1112,21 +1192,32 @@ namespace AdbcDrivers.BigQuery
+                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
+                 int length = 0;
+ 
+-                string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = @tableName";
+-                List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+-                queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
++                IEnumerable<BigQueryRow>? rows = null;
+ 
+-                if (columnNamePattern != null)
++                if (prefetchedRows != null)
+                 {
+-                    query += " AND column_name LIKE @columnNamePattern";
+-                    queryParams.Add(new BigQueryParameter("columnNamePattern", BigQueryDbType.String, columnNamePattern));
++                    // Use pre-fetched batch data — no SQL query needed
++                    rows = prefetchedRows;
+                 }
++                else
++                {
++                    // Fallback: per-table query
++                    string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = @tableName";
++                    List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
++                    queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
+ 
+-                BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams);
++                    if (columnNamePattern != null)
++                    {
++                        query += " AND column_name LIKE @columnNamePattern";
++                        queryParams.Add(new BigQueryParameter("columnNamePattern", BigQueryDbType.String, columnNamePattern));
++                    }
+ 
+-                if (result != null)
++                    rows = await ExecuteQueryAsync(query, parameters: queryParams);
++                }
++
++                if (rows != null)
+                 {
+-                    foreach (BigQueryRow row in result)
++                    foreach (BigQueryRow row in rows)
+                     {
+                         columnNameBuilder.Append(GetValue(row["column_name"]));
+                         ordinalPositionBuilder.Append((int)(long)row["ordinal_position"]);
+@@ -1205,7 +1296,8 @@ namespace AdbcDrivers.BigQuery
+             string catalog,
+             string dbSchema,
+             string table,
+-            string? columnNamePattern)
++            string? columnNamePattern,
++            List<BigQueryRow>? prefetchedRows = null)
+         {
+             return await this.TraceActivityAsync(async activity =>
+             {
+@@ -1216,15 +1308,25 @@ namespace AdbcDrivers.BigQuery
+                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
+                 int length = 0;
+ 
+-                string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE table_name = @tableName";
+-                List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+-                queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
++                IEnumerable<BigQueryRow>? rows = null;
+ 
+-                BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams);
++                if (prefetchedRows != null)
++                {
++                    // Use pre-fetched batch data — no SQL query needed
++                    rows = prefetchedRows;
++                }
++                else
++                {
++                    // Fallback: per-table query
++                    string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE table_name = @tableName";
++                    List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
++                    queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
++                    rows = await ExecuteQueryAsync(query, parameters: queryParams);
++                }
+ 
+-                if (result != null)
++                if (rows != null)
+                 {
+-                    foreach (BigQueryRow row in result)
++                    foreach (BigQueryRow row in rows)
+                     {
+                         string constraintName = GetValue(row["constraint_name"]);
+                         constraintNameBuilder.Append(constraintName);

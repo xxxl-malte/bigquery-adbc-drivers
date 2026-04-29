@@ -1,23 +1,9 @@
 From: Performance Patch Series
-Subject: [PATCH 07/10] Override async methods to avoid sync-over-async
-
-Bottleneck #2: The public ExecuteQuery() and ExecuteUpdate() methods
-wrap async implementations with .GetAwaiter().GetResult(), which blocks
-the calling thread. The base class AdbcStatement provides virtual async
-methods (ExecuteQueryAsync, ExecuteUpdateAsync) whose defaults wrap the
-sync methods in Task.Run — creating double wrapping.
-
-This patch overrides ExecuteQueryAsync and ExecuteUpdateAsync to call
-the internal async implementations directly, eliminating the sync-over-
-async penalty for callers using the async API (e.g., Power BI async
-data loading).
-
-The sync overrides are preserved unchanged for backward compatibility
-with callers using the synchronous API.
+Subject: [PATCH 07/16] 07-async-first-execute
 
 ---
- csharp/src/BigQueryStatement.cs | 30 ++++++++++++++++++++++++++++++
- 1 file changed, 30 insertions(+)
+ csharp/src/BigQueryStatement.cs | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
 
 diff --git a/csharp/src/BigQueryStatement.cs b/csharp/src/BigQueryStatement.cs
 index b3486b2..331e019 100644

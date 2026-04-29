@@ -1,30 +1,56 @@
 From: Performance Patch Series
-Subject: [PATCH 15/16] Add IAsyncDisposable to ReadRowsStream
+Subject: [PATCH 15/16] 15-async-dispose-readrowsstream
 
-Bug #15: ReadRowsStream.Dispose() calls
-`this.response?.DisposeAsync().GetAwaiter().GetResult()`, which is
-sync-over-async. While this runs only during cleanup (after
-cancellation) and is not a throughput bottleneck, it is a code quality
-issue that can cause thread-pool starvation under high concurrency.
+Async dispose for ReadRowsStream and MultiArrowReader.
+Fix Bug #8: Use Interlocked.Exchange for thread-safe disposed guard.
+MultiArrowReader implements IAsyncDisposable with proper async cleanup.
+ReadRowsStream.Dispose uses timeout-bounded Wait instead of blocking
+GetAwaiter().GetResult() to reduce sync-over-async risk.
 
-This patch adds IAsyncDisposable to ReadRowsStream with a proper async
-DisposeAsync() implementation. The sync Dispose() is preserved for
-callers that use synchronous disposal. MultiArrowReader.Dispose is
-updated to prefer DisposeAsync on readers that support it.
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 
 ---
+ csharp/src/BigQueryStatement.cs | 76 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 65 insertions(+), 11 deletions(-)
+
 diff --git a/csharp/src/BigQueryStatement.cs b/csharp/src/BigQueryStatement.cs
-index 8e73e1f..37cde26 100644
+index 8e73e1f..14c4c44 100644
 --- a/csharp/src/BigQueryStatement.cs
 +++ b/csharp/src/BigQueryStatement.cs
-@@ -1449,7 +1449,14 @@ namespace AdbcDrivers.BigQuery
+@@ -1292,7 +1292,7 @@ namespace AdbcDrivers.BigQuery
+             }
+         }
+ 
+-        private class MultiArrowReader : TracingReader
++        private class MultiArrowReader : TracingReader, IAsyncDisposable
+         {
+             private const string ClassName = BigQueryStatement.ClassName + ".MultiArrowReader";
+             private const int DefaultMaxConcurrency = 10;
+@@ -1309,7 +1309,7 @@ namespace AdbcDrivers.BigQuery
+             long memoryAtStart;
+             long peakMemory;
+             long totalBatchesRead;
+-            bool disposed;
++            int _disposed;
+ 
+             public MultiArrowReader(BigQueryStatement statement, Schema schema, IEnumerable<IArrowReader> readers, CancellationContext cancellationContext, int maxConcurrency = 0) : base(statement)
+             {
+@@ -1443,24 +1443,64 @@ namespace AdbcDrivers.BigQuery
+             {
+                 if (disposing)
+                 {
+-                    if (!this.disposed)
++                    if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                     {
+                         this.linkedCts.Cancel();
                          try { this.producerTask?.GetAwaiter().GetResult(); } catch { /* producers reported errors via channel */ }
                          foreach (var reader in this.readerList)
                          {
 -                            if (reader is IDisposable d) d.Dispose();
 +                            if (reader is IAsyncDisposable ad)
 +                            {
-+                                ad.DisposeAsync().AsTask().GetAwaiter().GetResult();
++                                // Best-effort sync dispose with timeout
++                                try { ad.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(5)); } catch { }
 +                            }
 +                            else if (reader is IDisposable d)
 +                            {
@@ -33,7 +59,51 @@ index 8e73e1f..37cde26 100644
                          }
                          this.linkedCts.Dispose();
                          this.concurrencyGate.Dispose();
-@@ -1473,7 +1480,7 @@ namespace AdbcDrivers.BigQuery
+                         this.cancellationContext.Dispose();
+-                        this.disposed = true;
+                     }
+                 }
+ 
+                 base.Dispose(disposing);
+             }
+ 
++            public async ValueTask DisposeAsyncCore()
++            {
++                if (Interlocked.Exchange(ref _disposed, 1) == 0)
++                {
++                    this.linkedCts.Cancel();
++                    if (this.producerTask != null)
++                    {
++                        try { await this.producerTask.ConfigureAwait(false); } catch { }
++                    }
++                    foreach (var reader in this.readerList)
++                    {
++                        if (reader is IAsyncDisposable ad)
++                        {
++                            await ad.DisposeAsync().ConfigureAwait(false);
++                        }
++                        else if (reader is IDisposable d)
++                        {
++                            d.Dispose();
++                        }
++                    }
++                    this.linkedCts.Dispose();
++                    this.concurrencyGate.Dispose();
++                    this.cancellationContext.Dispose();
++                }
++            }
++
++            public async ValueTask DisposeAsync()
++            {
++                await DisposeAsyncCore().ConfigureAwait(false);
++                Dispose(false);
++                GC.SuppressFinalize(this);
++            }
++
+             private static void InterlockedMax(ref long location, long value)
+             {
+                 long current = Interlocked.Read(ref location);
+@@ -1473,7 +1513,7 @@ namespace AdbcDrivers.BigQuery
              }
          }
  
@@ -42,23 +112,49 @@ index 8e73e1f..37cde26 100644
          {
              readonly IActivityTracer tracer;
              readonly TokenProtectedReadClientManger clientMgr;
-@@ -1688,7 +1695,18 @@ namespace AdbcDrivers.BigQuery
+@@ -1485,7 +1525,7 @@ namespace AdbcDrivers.BigQuery
+             IAsyncEnumerator<ReadRowsResponse>? response;
+             long rowsRead;
+             bool initialized;
+-            bool disposed;
++            int _disposed;
+ 
+             public ReadRowsStream(IActivityTracer tracer, TokenProtectedReadClientManger clientMgr, string streamName, int maxRetries, int initialDelayMs, CancellationToken cancellationToken)
              {
-                 if (!this.disposed)
+@@ -1541,7 +1581,7 @@ namespace AdbcDrivers.BigQuery
+             {
+                 return await this.tracer.TraceActivityAsync(async activity =>
+                 {
+-                    if (this.disposed || this.response == null)
++                    if (this._disposed != 0 || this.response == null)
+                     {
+                         return false;
+                     }
+@@ -1686,10 +1726,24 @@ namespace AdbcDrivers.BigQuery
+ 
+             public void Dispose()
+             {
+-                if (!this.disposed)
++                if (Interlocked.Exchange(ref _disposed, 1) == 0)
                  {
 -                    this.response?.DisposeAsync().GetAwaiter().GetResult();
-+                    DisposeAsync().AsTask().GetAwaiter().GetResult();
+-                    this.disposed = true;
++                    if (this.response != null)
++                    {
++                        // Best-effort sync dispose — fire and forget
++                        try { this.response.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(5)); } catch { }
++                    }
 +                }
 +            }
 +
 +            public async ValueTask DisposeAsync()
 +            {
-+                if (!this.disposed)
++                if (Interlocked.Exchange(ref _disposed, 1) == 0)
 +                {
 +                    if (this.response != null)
 +                    {
 +                        await this.response.DisposeAsync().ConfigureAwait(false);
 +                    }
-                     this.disposed = true;
                  }
              }
+         }

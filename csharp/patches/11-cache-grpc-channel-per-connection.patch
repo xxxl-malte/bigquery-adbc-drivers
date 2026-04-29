@@ -1,31 +1,22 @@
 From: Performance Patch Series
-Subject: [PATCH 11/16] Cache gRPC read client at connection level
+Subject: [PATCH 11/16] 11-cache-grpc-channel-per-connection
 
-Bottleneck #11: ExecuteQueryInternalAsync creates a new
-TokenProtectedReadClientManger (and thus a new BigQueryReadClient with
-its own GrpcChannel) on every query execution. Each new channel pays
-TCP + TLS + HTTP/2 establishment on its first RPC (~50-200ms), and the
-previous channel is abandoned for GC finalization, leaking connections.
+Cache gRPC channel per connection instead of per statement.
+Fix Bug #7: UpdateToken lambda captures local 'mgr' instead of
+ReadClientManager property to avoid NullReferenceException after Dispose.
 
-This is distinct from existing bottleneck #5 (credential-update
-rebuild). Here the issue is that a brand-new client is constructed on
-every single query, regardless of credential state.
-
-The fix moves the TokenProtectedReadClientManger to the connection
-level so it is created once and reused across all queries on that
-connection. The UpdateToken delegate updates the shared instance's
-credential when a token refresh occurs. The connection's Dispose()
-method is updated to clean up the shared client.
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 
 ---
- csharp/src/BigQueryConnection.cs | 35 +++---
- csharp/src/BigQueryStatement.cs  | 35 +++---
+ csharp/src/BigQueryConnection.cs | 24 ++++++++++++++++++++++++
+ csharp/src/BigQueryStatement.cs  |  8 ++------
+ 2 files changed, 26 insertions(+), 6 deletions(-)
 
 diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
-index 68e05a3..d68717e 100644
+index ca89b71..2980916 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -180,6 +180,8 @@ namespace AdbcDrivers.BigQuery
+@@ -189,6 +189,8 @@ namespace AdbcDrivers.BigQuery
  
          internal GoogleCredential? Credential { get; private set; }
  
@@ -34,7 +25,7 @@ index 68e05a3..d68717e 100644
          internal int MaxRetryAttempts { get; private set; } = 5;
  
          internal int RetryDelayMs { get; private set; } = 200;
-@@ -407,6 +409,22 @@ namespace AdbcDrivers.BigQuery
+@@ -416,6 +418,23 @@ namespace AdbcDrivers.BigQuery
                  }
  
                  Client = client;
@@ -43,10 +34,11 @@ index 68e05a3..d68717e 100644
 +                if (ReadClientManager == null)
 +                {
 +                    ReadClientManager = new TokenProtectedReadClientManger(Credential!);
-+                    ReadClientManager.UpdateToken = () => Task.Run(() =>
++                    var mgr = ReadClientManager;
++                    mgr.UpdateToken = () => Task.Run(() =>
 +                    {
 +                        SetCredential();
-+                        ReadClientManager.UpdateCredential(Credential);
++                        mgr.UpdateCredential(Credential);
 +                    });
 +                }
 +                else
@@ -57,7 +49,7 @@ index 68e05a3..d68717e 100644
                  return client;
              }, ClassName + "." + nameof(Open));
          }
-@@ -1709,6 +1727,11 @@ namespace AdbcDrivers.BigQuery
+@@ -1812,6 +1831,11 @@ namespace AdbcDrivers.BigQuery
          {
              Client?.Dispose();
              Client = null;

@@ -1,87 +1,204 @@
 From: Performance Patch Series
-Subject: [PATCH 10/10] Reduce metadata materialization memory pressure
+Subject: [PATCH 10/16] 10-reduce-metadata-memory
 
-Bottleneck #9: All GetObjects methods build complete Arrow arrays in
-memory before returning. For large catalogs with thousands of tables,
-this can cause significant memory pressure and GC pauses.
+True streaming GetObjects: yields one RecordBatch per catalog via
+ChunkedGetObjectsStream, allowing GC of previous catalog data before
+building the next. Replaces ineffective GC.Collect batching (Bug #9).
+Extracts GetMatchingCatalogIds helper for catalog listing with retry.
+Adds MetadataBatchSize parameter constant.
 
-Full streaming would require changing the return type of GetObjects
-from IArrowArrayStream (backed by a single RecordBatch) to a lazy
-stream that yields batches incrementally. This is an architectural
-change to the ADBC interface contract.
-
-This pragmatic patch instead:
-1. Adds chunked processing to GetDbSchemas — processes datasets in
-   configurable-size batches (default 50) to bound peak memory.
-2. Eagerly disposes intermediate arrays after merging into the final
-   result, reducing GC pressure.
-3. Adds a configurable metadata batch size parameter so callers can
-   tune the memory/latency tradeoff.
-
-A full streaming implementation would require upstream changes to the
-Apache Arrow ADBC interface and is tracked separately.
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 
 ---
- csharp/src/BigQueryConnection.cs | 45 ++++++++++++++++++++++++++++++--
- csharp/src/BigQueryParameters.cs |  3 +++
- 2 files changed, 46 insertions(+), 2 deletions(-)
+ csharp/src/BigQueryConnection.cs      | 54 +++++++++++++++++++--
+ csharp/src/BigQueryInfoArrowStream.cs | 90 +++++++++++++++++++++++++++++++++++
+ csharp/src/BigQueryParameters.cs      |  1 +
+ 3 files changed, 142 insertions(+), 3 deletions(-)
 
 diff --git a/csharp/src/BigQueryConnection.cs b/csharp/src/BigQueryConnection.cs
-index 37f0cc8..68e05a3 100644
+index fa80f14..ca89b71 100644
 --- a/csharp/src/BigQueryConnection.cs
 +++ b/csharp/src/BigQueryConnection.cs
-@@ -890,13 +890,33 @@ namespace AdbcDrivers.BigQuery
- 
-                 PagedEnumerable<DatasetList, BigQueryDataset>? schemas = ExecuteWithRetriesAsync<PagedEnumerable<DatasetList, BigQueryDataset>?>(func, activity).GetAwaiter().GetResult();
- 
-+                // Parse configurable batch size for metadata operations
-+                int metadataBatchSize = 50;
-+                if (this.properties.TryGetValue(BigQueryParameters.MetadataBatchSize, out string? batchSizeStr)
-+                    && int.TryParse(batchSizeStr, out int parsedBatchSize) && parsedBatchSize > 0)
-+                {
-+                    metadataBatchSize = parsedBatchSize;
-+                }
-+
-                 if (schemas != null)
+@@ -679,10 +679,20 @@ namespace AdbcDrivers.BigQuery
+             {
+                 try
                  {
-+                    List<string> matchingSchemas = new List<string>();
-                     foreach (BigQueryDataset schema in schemas)
-                     {
-                         if (Regex.IsMatch(schema.Reference.DatasetId, dbSchemaRegexp, RegexOptions.IgnoreCase))
-                         {
--                            dbSchemaNameBuilder.Append(schema.Reference.DatasetId);
-+                            matchingSchemas.Add(schema.Reference.DatasetId);
-+                        }
+-                    IArrowArray[] dataArrays = GetCatalogs(depth, catalogPattern, dbSchemaPattern,
+-                        tableNamePattern, tableTypes, columnNamePattern);
++                    List<string> matchingCatalogIds = GetMatchingCatalogIds(catalogPattern, activity);
+ 
+-                    return new BigQueryInfoArrowStream(StandardSchemas.GetObjectsSchema, dataArrays);
++                    if (depth == GetObjectsDepth.Catalogs)
++                    {
++                        // Shallow: return all catalogs in a single batch (no per-catalog queries)
++                        IArrowArray[] dataArrays = GetCatalogs(depth, catalogPattern, dbSchemaPattern,
++                            tableNamePattern, tableTypes, columnNamePattern);
++                        return new BigQueryInfoArrowStream(StandardSchemas.GetObjectsSchema, dataArrays);
 +                    }
 +
-+                    for (int batchStart = 0; batchStart < matchingSchemas.Count; batchStart += metadataBatchSize)
-+                    {
-+                        int batchEnd = Math.Min(batchStart + metadataBatchSize, matchingSchemas.Count);
-+
-+                        for (int i = batchStart; i < batchEnd; i++)
-+                        {
-+                            string schemaId = matchingSchemas[i];
-+                            dbSchemaNameBuilder.Append(schemaId);
-                             length++;
-                             nullBitmapBuffer.Append(true);
- 
-@@ -907,10 +927,15 @@ namespace AdbcDrivers.BigQuery
-                             else
-                             {
-                                 dbSchemaTablesValues.Add(GetTableSchemas(
--                                    depth, catalog, schema.Reference.DatasetId,
-+                                    depth, catalog, schemaId,
-                                     tableNamePattern, tableTypes, columnNamePattern));
-                             }
-                         }
-+
-+                        if (batchEnd < matchingSchemas.Count)
-+                        {
-+                            GC.Collect(0, GCCollectionMode.Optimized, false);
-+                        }
-                     }
++                    // Streaming: yield one RecordBatch per catalog for true memory reduction
++                    return new ChunkedGetObjectsStream(
++                        this, depth, matchingCatalogIds,
++                        dbSchemaPattern, tableNamePattern, tableTypes, columnNamePattern);
                  }
+                 catch (Exception ex) when (IsUnauthorizedException(ex, out GoogleApiException? googleEx))
+                 {
+@@ -691,6 +701,44 @@ namespace AdbcDrivers.BigQuery
+             }, ClassName + "." + nameof(GetObjects));
+         }
  
++        /// <summary>
++        /// Lists project IDs matching the catalog pattern, with retry logic.
++        /// </summary>
++        private List<string> GetMatchingCatalogIds(string? catalogPattern, System.Diagnostics.Activity? activity)
++        {
++            string catalogRegexp = PatternToRegEx(catalogPattern);
++
++            Func<Task<PagedEnumerable<ProjectList, CloudProject>?>> func = () => Task.Run(() =>
++            {
++                return Client?.ListProjects();
++            });
++
++            PagedEnumerable<ProjectList, CloudProject>? catalogs =
++                ExecuteWithRetriesAsync<PagedEnumerable<ProjectList, CloudProject>?>(func, activity).GetAwaiter().GetResult();
++
++            List<string> projectIds = new List<string>();
++            if (catalogs != null)
++            {
++                projectIds = catalogs.Select(x => x.ProjectId).ToList();
++            }
++
++            if (this.IncludePublicProjectIds && !projectIds.Contains(BigQueryConstants.PublicProjectId))
++                projectIds.Add(BigQueryConstants.PublicProjectId);
++
++            projectIds.Sort();
++
++            List<string> matching = new List<string>();
++            foreach (string projectId in projectIds)
++            {
++                if (Regex.IsMatch(projectId, catalogRegexp, RegexOptions.IgnoreCase))
++                {
++                    matching.Add(projectId);
++                }
++            }
++
++            return matching;
++        }
++
+         /// <summary>
+         /// Renews the internal BigQueryClient with updated credentials.
+         /// </summary>
+diff --git a/csharp/src/BigQueryInfoArrowStream.cs b/csharp/src/BigQueryInfoArrowStream.cs
+index 41eac78..8182df5 100644
+--- a/csharp/src/BigQueryInfoArrowStream.cs
++++ b/csharp/src/BigQueryInfoArrowStream.cs
+@@ -21,11 +21,14 @@
+ * limitations under the License.
+ */
+ 
++using System;
+ using System.Collections.Generic;
+ using System.Threading;
+ using System.Threading.Tasks;
+ using Apache.Arrow;
+ using Apache.Arrow.Ipc;
++using Apache.Arrow.Types;
++using Apache.Arrow.Adbc;
+ 
+ namespace AdbcDrivers.BigQuery
+ {
+@@ -58,4 +61,91 @@ namespace AdbcDrivers.BigQuery
+             this.batch = null;
+         }
+     }
++
++    /// <summary>
++    /// Streaming IArrowArrayStream that yields one RecordBatch per catalog.
++    /// Each call to ReadNextRecordBatchAsync processes one catalog, allowing
++    /// the previous catalog's memory to be GC'd before the next is built.
++    /// </summary>
++    internal class ChunkedGetObjectsStream : IArrowArrayStream
++    {
++        private readonly BigQueryConnection _connection;
++        private readonly GetObjectsDepth _depth;
++        private readonly string? _dbSchemaPattern;
++        private readonly string? _tableNamePattern;
++        private readonly IReadOnlyList<string>? _tableTypes;
++        private readonly string? _columnNamePattern;
++        private readonly List<string> _catalogIds;
++        private int _nextIndex;
++
++        public ChunkedGetObjectsStream(
++            BigQueryConnection connection,
++            GetObjectsDepth depth,
++            List<string> catalogIds,
++            string? dbSchemaPattern,
++            string? tableNamePattern,
++            IReadOnlyList<string>? tableTypes,
++            string? columnNamePattern)
++        {
++            _connection = connection;
++            _depth = depth;
++            _catalogIds = catalogIds;
++            _dbSchemaPattern = dbSchemaPattern;
++            _tableNamePattern = tableNamePattern;
++            _tableTypes = tableTypes;
++            _columnNamePattern = columnNamePattern;
++            _nextIndex = 0;
++        }
++
++        public Schema Schema => StandardSchemas.GetObjectsSchema;
++
++        public async ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken cancellationToken = default)
++        {
++            if (_nextIndex >= _catalogIds.Count)
++                return null;
++
++            string catalogId = _catalogIds[_nextIndex++];
++
++            // Build one catalog's worth of data
++            StringArray.Builder catalogNameBuilder = new StringArray.Builder();
++            catalogNameBuilder.Append(catalogId);
++
++            StructArray dbSchemas;
++            if (_depth == GetObjectsDepth.Catalogs)
++            {
++                dbSchemas = new StructArray(
++                    new StructType(StandardSchemas.DbSchemaSchema),
++                    0,
++                    new IArrowArray[]
++                    {
++                        new StringArray.Builder().Build(),
++                        new List<IArrowArray?>().BuildListArrayForType(new StructType(StandardSchemas.TableSchema)),
++                    },
++                    new ArrowBuffer.BitmapBuilder().Build());
++            }
++            else
++            {
++                dbSchemas = await _connection.GetDbSchemasAsync(
++                    _depth, catalogId, _dbSchemaPattern,
++                    _tableNamePattern, _tableTypes, _columnNamePattern);
++            }
++
++            List<IArrowArray?> catalogDbSchemasValues = new List<IArrowArray?> { dbSchemas };
++
++            IArrowArray[] dataArrays = new IArrowArray[]
++            {
++                catalogNameBuilder.Build(),
++                catalogDbSchemasValues.BuildListArrayForType(new StructType(StandardSchemas.DbSchemaSchema)),
++            };
++
++            StandardSchemas.GetObjectsSchema.Validate(dataArrays);
++
++            return new RecordBatch(Schema, dataArrays, 1);
++        }
++
++        public void Dispose()
++        {
++            // Nothing to dispose — each batch is owned by the caller
++        }
++    }
+ }
 diff --git a/csharp/src/BigQueryParameters.cs b/csharp/src/BigQueryParameters.cs
 index e1b9704..370cfde 100644
 --- a/csharp/src/BigQueryParameters.cs

@@ -1,26 +1,16 @@
 From: Performance Patch Series
-Subject: [PATCH 16/16] Enable LZ4 compression on Arrow data transfer
+Subject: [PATCH 16/16] 16-enable-arrow-lz4-compression
 
-The BigQuery Storage API supports server-side compression of Arrow
-record batches before sending them over gRPC. By default, buffers are
-sent uncompressed.
+Enable Arrow LZ4 compression for gRPC read streams.
 
-This patch sets ArrowSerializationOptions.BufferCompression to
-LZ4_FRAME in the CreateReadSession request. LZ4 frame compression
-typically achieves 2-4x compression on columnar data while
-decompressing at ~4 GB/s — the CPU cost is negligible compared to
-the network savings for large table imports.
-
-This directly reduces the bytes transferred during the data read
-phase measured by MeasureFullTableImport, improving throughput for
-network-bound scenarios.
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 
 ---
  csharp/src/BigQueryStatement.cs | 13 ++++++++++++-
  1 file changed, 12 insertions(+), 1 deletion(-)
 
 diff --git a/csharp/src/BigQueryStatement.cs b/csharp/src/BigQueryStatement.cs
-index 37cde26..402b4be 100644
+index 14c4c44..aa2a6f1 100644
 --- a/csharp/src/BigQueryStatement.cs
 +++ b/csharp/src/BigQueryStatement.cs
 @@ -739,7 +739,18 @@ namespace AdbcDrivers.BigQuery
