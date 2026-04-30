@@ -374,6 +374,15 @@ write_perftests_md() {
         echo "**Last updated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "**Patches:** $TOTAL_PATCHES applied incrementally"
         echo "**Cooldown between runs:** ${COOLDOWN_SECS}s"
+
+        # Show preflight connectivity check status if available
+        local preflight_status preflight_completed
+        preflight_status=$(cat "$RESULTS_DIR/preflight_status" 2>/dev/null || echo "")
+        if [[ -n "$preflight_status" ]]; then
+            preflight_completed=$(cat "$RESULTS_DIR/preflight_completed" 2>/dev/null || echo "")
+            echo "**Connectivity check:** $(status_emoji "$preflight_status") $preflight_status ($preflight_completed)"
+        fi
+
         echo ""
 
         # Summary table
@@ -425,6 +434,26 @@ write_perftests_md() {
         # Detailed sections
         echo "## Detailed Results"
         echo ""
+
+        # Preflight connectivity check
+        if [[ -f "$RESULTS_DIR/preflight_output.txt" ]]; then
+            local pf_status pf_completed
+            pf_status=$(cat "$RESULTS_DIR/preflight_status" 2>/dev/null || echo "N/A")
+            pf_completed=$(cat "$RESULTS_DIR/preflight_completed" 2>/dev/null || echo "N/A")
+            echo "### Preflight: Connectivity Check"
+            echo ""
+            echo "**Status:** $(status_emoji "$pf_status") $pf_status"
+            echo "**Completed:** $pf_completed"
+            echo ""
+            echo "<details>"
+            echo "<summary>Full preflight output</summary>"
+            echo ""
+            echo '```'
+            cat "$RESULTS_DIR/preflight_output.txt"
+            echo '```'
+            echo "</details>"
+            echo ""
+        fi
 
         if [[ "$SKIP_BASELINE" == false ]] && [[ -f "$RESULTS_DIR/baseline_output.txt" ]]; then
             echo "### Baseline (no patches)"
@@ -502,6 +531,85 @@ cooldown_between_runs() {
     done
     printf "\r  ✅ Cooldown complete.                    \n"
 }
+
+# ----- preflight: verify BigQuery connectivity -----
+echo ""
+echo "=========================================="
+echo "Preflight: Verifying BigQuery connectivity"
+echo "=========================================="
+
+preflight_env_args=()
+if [[ -f "$ENV_FILE" ]]; then
+    preflight_env_args+=(--env-file "$ENV_FILE")
+fi
+
+preflight_gcp_args=()
+if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
+    preflight_gcp_args+=(-v "$GOOGLE_APPLICATION_CREDENTIALS:/repo/gcp-credentials.json:ro")
+    preflight_gcp_args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/repo/gcp-credentials.json")
+elif [[ -f "$HOME/.config/gcloud/application_default_credentials.json" ]]; then
+    preflight_gcp_args+=(-v "$HOME/.config/gcloud/application_default_credentials.json:/repo/gcp-credentials.json:ro")
+    preflight_gcp_args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/repo/gcp-credentials.json")
+fi
+
+preflight_docker_common=(
+    --rm
+    --user "$(id -u):$(id -g)"
+    -e HOME=/tmp/dotnet-home
+    -e DOTNET_CLI_HOME=/tmp/dotnet-home
+    -e NUGET_PACKAGES=/tmp/nuget-cache
+    ${preflight_env_args[@]+"${preflight_env_args[@]}"}
+    ${preflight_gcp_args[@]+"${preflight_gcp_args[@]}"}
+    -v nuget-perf-cache:/tmp/nuget-cache
+    -v "$WT_CSHARP:/repo/csharp"
+    -w /repo/csharp
+)
+
+PREFLIGHT_OUTPUT="$RESULTS_DIR/preflight_output.txt"
+
+echo "  Building..."
+if ! docker run "${preflight_docker_common[@]}" \
+    "$DOCKER_IMAGE" \
+    sh -c "dotnet restore perf/AdbcDrivers.BigQuery.Perf.csproj && dotnet build perf/AdbcDrivers.BigQuery.Perf.csproj -c Release --no-restore" \
+    > "$PREFLIGHT_OUTPUT" 2>&1; then
+
+    echo "  ❌ Build FAILED during preflight"
+    echo ""
+    tail -20 "$PREFLIGHT_OUTPUT"
+    echo "BUILD_FAILED" > "$RESULTS_DIR/preflight_status"
+    date -u '+%Y-%m-%d %H:%M:%S UTC' > "$RESULTS_DIR/preflight_completed"
+    write_perftests_md || true
+    exit 1
+fi
+
+echo "  Running connectivity check..."
+if docker run "${preflight_docker_common[@]}" \
+    -e "BIGQUERY_PERF_CONFIG_FILE=/repo/perfconfig.json" \
+    -v "$CONFIG_FILE:/repo/perfconfig.json:ro" \
+    "$DOCKER_IMAGE" \
+    dotnet test perf/AdbcDrivers.BigQuery.Perf.csproj \
+        -c Release \
+        --no-build \
+        --logger "console;verbosity=detailed" \
+        --filter "FullyQualifiedName=AdbcDrivers.BigQuery.Perf.FullTableImportTest.VerifyConnectivity" \
+    >> "$PREFLIGHT_OUTPUT" 2>&1; then
+
+    echo "  ✅ BigQuery connectivity verified"
+    echo "PASSED" > "$RESULTS_DIR/preflight_status"
+else
+    echo "  ❌ BigQuery connectivity check FAILED"
+    echo ""
+    echo "  Cannot reach BigQuery or authenticate. Aborting suite."
+    echo "  Check credentials, network, and project configuration."
+    echo ""
+    echo "--- Preflight output (last 30 lines) ---"
+    tail -30 "$PREFLIGHT_OUTPUT"
+    echo "FAILED" > "$RESULTS_DIR/preflight_status"
+    date -u '+%Y-%m-%d %H:%M:%S UTC' > "$RESULTS_DIR/preflight_completed"
+    write_perftests_md || true
+    exit 1
+fi
+date -u '+%Y-%m-%d %H:%M:%S UTC' > "$RESULTS_DIR/preflight_completed"
 
 # ----- run baseline -----
 if [[ "$SKIP_BASELINE" == false ]]; then
