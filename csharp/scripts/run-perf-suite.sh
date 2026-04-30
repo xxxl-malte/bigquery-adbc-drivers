@@ -122,6 +122,12 @@ cleanup() {
     # Clean up any leftover temp files from atomic writes
     rm -f "${OUTPUT_FILE}.tmp."* 2>/dev/null || true
     echo "Cleaning up worktree..."
+    # Safety net: fix ownership of any root-owned files left by Docker.
+    # Even with --user, some dotnet internals may create root-owned files.
+    if [[ -d "$WORKTREE_DIR" ]]; then
+        docker run --rm -v "$WORKTREE_DIR:/worktree" "$DOCKER_IMAGE" \
+            chown -R "$(id -u):$(id -g)" /worktree 2>/dev/null || true
+    fi
     cd "$REPO_ROOT"
     git worktree remove --force "$WORKTREE_DIR" 2>/dev/null || rm -rf "$WORKTREE_DIR"
     if [[ -n "${RESULTS_DIR:-}" ]] && [[ -d "$RESULTS_DIR" ]]; then
@@ -219,11 +225,17 @@ run_perf_test() {
 
     # Common docker args for both build and test containers.
     # The volume mounts ensure build artifacts persist across containers.
+    # --user ensures files are created with host-user ownership so the
+    # cleanup trap (and intermediate rm -rf between patches) can delete them.
     local -a docker_common=(
         --rm
+        --user "$(id -u):$(id -g)"
+        -e HOME=/tmp/dotnet-home
+        -e DOTNET_CLI_HOME=/tmp/dotnet-home
+        -e NUGET_PACKAGES=/tmp/nuget-cache
         ${env_args[@]+"${env_args[@]}"}
         ${gcp_cred_args[@]+"${gcp_cred_args[@]}"}
-        -v nuget-perf-cache:/root/.nuget/packages
+        -v nuget-perf-cache:/tmp/nuget-cache
         -v "$wt_csharp:/repo/csharp"
         -w /repo/csharp
     )

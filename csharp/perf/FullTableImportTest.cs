@@ -192,6 +192,52 @@ namespace AdbcDrivers.BigQuery.Perf
         }
 
         /// <summary>
+        /// Quick connectivity preflight: connects to each configured environment
+        /// and executes SELECT 1 to verify credentials, network, and project access
+        /// before committing to a full (potentially multi-hour) test suite.
+        /// </summary>
+        [SkippableFact]
+        public async Task VerifyConnectivity()
+        {
+            bool allOk = true;
+
+            foreach (PerfTestEnvironment env in _environments)
+            {
+                Log($"Connectivity check: {env.Name} ...");
+                try
+                {
+                    Stopwatch sw = Stopwatch.StartNew();
+                    Dictionary<string, string> parameters = BuildParameters(env);
+                    AdbcDatabase database = new BigQueryDriver().Open(parameters);
+                    using AdbcConnection connection = database.Connect(new Dictionary<string, string>());
+                    using AdbcStatement statement = connection.CreateStatement();
+                    statement.SqlQuery = "SELECT 1 AS connectivity_check";
+
+                    QueryResult result = statement.ExecuteQuery();
+                    using (IArrowArrayStream stream = result.Stream!)
+                    {
+                        RecordBatch? batch = await stream.ReadNextRecordBatchAsync();
+                        if (batch == null || batch.Length == 0)
+                        {
+                            Log($"  ❌ {env.Name}: query returned no rows");
+                            allOk = false;
+                            continue;
+                        }
+                    }
+                    sw.Stop();
+                    Log($"  ✅ {env.Name}: OK ({sw.Elapsed.TotalSeconds:F1}s)");
+                }
+                catch (Exception ex)
+                {
+                    Log($"  ❌ {env.Name}: {ex.GetType().Name}: {ex.Message}");
+                    allOk = false;
+                }
+            }
+
+            Assert.True(allOk, "One or more environments failed the connectivity check. See output for details.");
+        }
+
+        /// <summary>
         /// Runs the same full table import multiple times and reports statistics
         /// to account for variance in network/server conditions.
         /// </summary>

@@ -69,6 +69,11 @@ docker pull "$DOCKER_IMAGE" --quiet >/dev/null 2>&1 || true
 WORKTREE_DIR="$(mktemp -d)"
 cleanup() {
     cd "$REPO_ROOT"
+    # Fix ownership of any root-owned files left by Docker
+    if [[ -d "$WORKTREE_DIR" ]]; then
+        docker run --rm -v "$WORKTREE_DIR:/worktree" "$DOCKER_IMAGE" \
+            chown -R "$(id -u):$(id -g)" /worktree 2>/dev/null || true
+    fi
     git worktree remove --force "$WORKTREE_DIR" 2>/dev/null || rm -rf "$WORKTREE_DIR"
 }
 trap cleanup EXIT
@@ -125,9 +130,13 @@ OUTPUT_FILE="$(mktemp)"
 start_time=$(date +%s)
 
 if docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/dotnet-home \
+    -e DOTNET_CLI_HOME=/tmp/dotnet-home \
+    -e NUGET_PACKAGES=/tmp/nuget-cache \
     ${env_args[@]+"${env_args[@]}"} \
     ${gcp_cred_args[@]+"${gcp_cred_args[@]}"} \
-    -v nuget-perf-cache:/root/.nuget/packages \
+    -v nuget-perf-cache:/tmp/nuget-cache \
     -e "BIGQUERY_PERF_CONFIG_FILE=/repo/perfconfig.json" \
     -v "$WT_CSHARP:/repo/csharp" \
     -v "$CONFIG_FILE:/repo/perfconfig.json:ro" \
