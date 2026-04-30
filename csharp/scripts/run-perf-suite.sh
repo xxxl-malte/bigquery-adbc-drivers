@@ -107,6 +107,19 @@ echo "Testing against commit: $COMMIT_SHA"
 echo "Pulling Docker image: $DOCKER_IMAGE ..."
 docker pull "$DOCKER_IMAGE" --quiet >/dev/null 2>&1 || true
 
+# ----- ensure nuget cache volume is writable by host user -----
+# Docker named volumes default to root:root ownership. The build/test
+# containers below run with --user "$(id -u):$(id -g)" so artifacts land
+# with host ownership; without this chown they can't write to the cache
+# and dotnet restore fails with "Access to the path '/tmp/nuget-cache'
+# is denied". This container intentionally omits --user so it runs as
+# root and can chown the volume. Idempotent: a no-op once ownership is
+# correct.
+echo "Ensuring NuGet cache volume ownership..."
+docker volume create nuget-perf-cache >/dev/null
+docker run --rm -v nuget-perf-cache:/cache "$DOCKER_IMAGE" \
+    chown -R "$(id -u):$(id -g)" /cache
+
 # ----- create worktree -----
 WORKTREE_DIR="$(mktemp -d)"
 echo "Creating worktree at $WORKTREE_DIR ..."
