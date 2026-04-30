@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
 #
-# run-perf-suite.sh — Stacked patch performance test orchestrator
+# run-metadata-perf-suite.sh — Stacked patch performance suite for the
+# metadata path (Connection.GetObjects).
 #
-# Runs the BigQuery ADBC C# performance tests with patches applied
-# incrementally. Each test level stacks one more patch on top of
-# the previous, measuring cumulative impact.
+# Mirrors run-perf-suite.sh but exercises the schema-discovery path
+# instead of full-table-import. Use this script to evaluate patches that
+# touch INFORMATION_SCHEMA queries, GetObjects fan-out, parameterized
+# metadata queries, and streaming GetObjects (e.g. patches 01, 02, 08,
+# 09, 10, 13 in the current series). The data-path test in
+# run-perf-suite.sh does not exercise those code paths.
 #
-# Results are written to PERFTESTS.md with both a summary table
-# and detailed per-test sections. The file is atomically updated
-# after each test run so it always reflects the latest state, even
-# if the suite is interrupted.
+# Results are written to PERFTESTS_METADATA.md (default).
 #
 # Usage:
-#   ./scripts/run-perf-suite.sh [OPTIONS]
+#   ./scripts/run-metadata-perf-suite.sh [OPTIONS]
 #
 # Options:
 #   --config PATH       Path to perfconfig.json (required)
 #   --commit SHA        Git commit to test against (default: HEAD)
 #   --patches DIR       Directory containing .patch files (default: ./patches)
-#   --output PATH       Output file path (default: ./PERFTESTS.md)
+#   --output PATH       Output file path (default: ./PERFTESTS_METADATA.md)
 #   --skip-baseline     Skip the baseline (no-patches) run
 #   --only N            Only run up to patch N (0 = baseline only)
 #   --env-file PATH     Path to .env file for Docker (default: ./.env)
 #   --image NAME        Docker SDK image (default: mcr.microsoft.com/dotnet/sdk:8.0)
-#   --cooldown SECS     Seconds to wait between test runs to mitigate BQ throttling (default: 60)
+#   --cooldown SECS     Seconds to wait between test runs (default: 30)
 #   --help              Show this help message
 #
 set -euo pipefail
@@ -36,20 +37,30 @@ REPO_ROOT="$(cd "$CSHARP_DIR/.." && pwd)"
 CONFIG_FILE=""
 COMMIT="HEAD"
 PATCHES_DIR="$CSHARP_DIR/patches"
-OUTPUT_FILE="$CSHARP_DIR/PERFTESTS.md"
+OUTPUT_FILE="$CSHARP_DIR/PERFTESTS_METADATA.md"
 SKIP_BASELINE=false
 ONLY_UPTO=-1  # -1 means all
 ENV_FILE="$CSHARP_DIR/.env"
 DOCKER_IMAGE="mcr.microsoft.com/dotnet/sdk:8.0"
-COOLDOWN_SECS=60  # seconds to wait between test runs to mitigate BQ throttling
+# Metadata calls don't go through the Storage Read API, so server-side
+# throttling is far less of a concern than for the data path. Default
+# cooldown is correspondingly shorter than run-perf-suite.sh.
+COOLDOWN_SECS=30
 
-# Patches whose effects live on the metadata path. They are still applied
-# (so the canonical 1→16 stack is preserved for tested rows), but their
-# per-patch build+test is skipped — this script's data-path test would
-# not measure their effect anyway. Use run-metadata-perf-suite.sh to
-# evaluate these patches. Patch numbers are matched by the leading
-# two-digit prefix of the patch filename (e.g. "09-batch-..." → "09").
-SKIP_TEST_PATCHES=(01 02 08 09 10 13)
+# Patches whose effects live on the data path (Storage Read API, query
+# execution, gRPC channels). They are still applied (so the canonical
+# 1→16 stack is preserved for tested rows), but their per-patch
+# build+test is skipped — this script's metadata test would not measure
+# their effect anyway. Use run-perf-suite.sh to evaluate these patches.
+# Patch numbers are matched by the leading two-digit prefix of the patch
+# filename (e.g. "06-reuse-..." → "06").
+SKIP_TEST_PATCHES=(06 07 11 12 15 16)
+
+# Test filters (the only meaningful difference from run-perf-suite.sh besides
+# the parsed metrics). Kept as variables so the rest of the script reads
+# identically to its sibling.
+TEST_FILTER="FullyQualifiedName=AdbcDrivers.BigQuery.Perf.GetObjectsTest.MeasureGetObjectsRepeated"
+PREFLIGHT_FILTER="FullyQualifiedName=AdbcDrivers.BigQuery.Perf.GetObjectsTest.VerifyMetadataConnectivity"
 
 # Track suite state
 SUITE_START_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -134,17 +145,12 @@ echo "Creating worktree at $WORKTREE_DIR ..."
 
 cleanup() {
     echo ""
-    # Write final PERFTESTS.md only on abnormal exit (interrupt/error).
-    # Normal completion already wrote the final version in the main loop.
     if [[ "$SUITE_COMPLETED" == false ]] && [[ -n "${RESULTS_DIR:-}" ]] && [[ -d "$RESULTS_DIR" ]]; then
         write_perftests_md || true
         echo "Results saved to $OUTPUT_FILE"
     fi
-    # Clean up any leftover temp files from atomic writes
     rm -f "${OUTPUT_FILE}.tmp."* 2>/dev/null || true
     echo "Cleaning up worktree..."
-    # Safety net: fix ownership of any root-owned files left by Docker.
-    # Even with --user, some dotnet internals may create root-owned files.
     if [[ -d "$WORKTREE_DIR" ]]; then
         docker run --rm -v "$WORKTREE_DIR:/worktree" "$DOCKER_IMAGE" \
             chown -R "$(id -u):$(id -g)" /worktree 2>/dev/null || true
@@ -164,9 +170,6 @@ git worktree add "$WORKTREE_DIR" "$COMMIT_SHA" --detach --quiet
 echo "Worktree created."
 
 # ----- initialize submodule in worktree -----
-# Git worktrees don't auto-init submodules; the csharp/arrow-adbc
-# directory will be empty. We copy it from the main tree to avoid
-# a slow re-clone from GitHub.
 WT_CSHARP="$WORKTREE_DIR/csharp"
 MAIN_SUBMODULE="$CSHARP_DIR/arrow-adbc"
 
@@ -184,19 +187,14 @@ fi
 
 # ----- copy test infrastructure into worktree -----
 # The perf/ directory may not exist at the target commit (it was added
-# later). Copy it from the current tree so the worktree can run
-# performance tests at any commit.
+# later). Copy it from the current tree so the worktree can run the
+# metadata tests at any commit.
 echo "Copying test infrastructure into worktree..."
 rm -rf "$WT_CSHARP/perf"
 cp -R "$CSHARP_DIR/perf" "$WT_CSHARP/perf"
 echo "  Copied: perf/"
 
 # ----- purge host build artifacts from worktree -----
-# cp -R copies obj/bin directories that contain host-specific paths
-# (e.g., /Users/.../. nuget/packages). These are invalid inside the Docker
-# container. Remove ALL obj/bin once; the first dotnet restore will recreate
-# them with correct container paths. Subsequent per-run cleanups only touch
-# src/obj+bin and perf/bin (things that change between patches).
 echo "Cleaning host build artifacts from worktree..."
 find "$WT_CSHARP" -type d \( -name obj -o -name bin \) -exec rm -rf {} + 2>/dev/null || true
 echo "  Done."
@@ -216,25 +214,17 @@ run_perf_test() {
     local wt_csharp="$WORKTREE_DIR/csharp"
     local output_file="$RESULTS_DIR/${test_id}_output.txt"
 
-    # Clean previous build artifacts (src only + perf binaries, NOT arrow-adbc)
-    # This ensures patches get a fresh build instead of stale incremental results.
-    # We preserve perf/obj because it contains project.assets.json (NuGet restore
-    # metadata). The perf project doesn't change between patches, so its restore
-    # state is stable. Deleting it causes "Could not find project.assets.json"
-    # errors because dotnet build's implicit restore doesn't always recreate it.
     echo "  Cleaning build artifacts..."
     rm -rf "$wt_csharp/src/obj" "$wt_csharp/src/bin"
     rm -rf "$wt_csharp/perf/bin"
     rm -rf "$wt_csharp/artifacts/AdbcDrivers.BigQuery"
     rm -rf "$wt_csharp/artifacts/AdbcDrivers.BigQuery.Perf"
 
-    # Prepare volume mounts and env args
     local env_args=()
     if [[ -f "$ENV_FILE" ]]; then
         env_args+=(--env-file "$ENV_FILE")
     fi
 
-    # Mount GCP credentials if available (for Application Default Credentials)
     local gcp_cred_args=()
     if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]] && [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
         gcp_cred_args+=(-v "$GOOGLE_APPLICATION_CREDENTIALS:/repo/gcp-credentials.json:ro")
@@ -244,10 +234,6 @@ run_perf_test() {
         gcp_cred_args+=(-e "GOOGLE_APPLICATION_CREDENTIALS=/repo/gcp-credentials.json")
     fi
 
-    # Common docker args for both build and test containers.
-    # The volume mounts ensure build artifacts persist across containers.
-    # --user ensures files are created with host-user ownership so the
-    # cleanup trap (and intermediate rm -rf between patches) can delete them.
     local -a docker_common=(
         --rm
         --user "$(id -u):$(id -g)"
@@ -277,7 +263,6 @@ run_perf_test() {
         echo "$((build_end - build_start))" > "$RESULTS_DIR/${test_id}_buildtime"
         echo "0" > "$RESULTS_DIR/${test_id}_wallclock"
         date -u '+%Y-%m-%d %H:%M:%S UTC' > "$RESULTS_DIR/${test_id}_completed"
-        # Copy build output as main output for error reporting
         cp "$build_file" "$output_file"
         echo ""
         tail -20 "$output_file"
@@ -290,7 +275,7 @@ run_perf_test() {
     echo "  Build succeeded (${build_secs}s)"
 
     # --- Step 2: Run test only (this is the timed performance measurement) ---
-    echo "  Running perf test..."
+    echo "  Running metadata perf test..."
     local start_time end_time
     start_time=$(date +%s)
 
@@ -302,12 +287,11 @@ run_perf_test() {
             -c Release \
             --no-build \
             --logger "console;verbosity=detailed" \
-            --filter "FullyQualifiedName=AdbcDrivers.BigQuery.Perf.FullTableImportTest.MeasureFullTableImportRepeated" \
+            --filter "$TEST_FILTER" \
         > "$output_file" 2>&1; then
 
         end_time=$(date +%s)
 
-        # Verify tests actually ran (exit 0 with 0 tests = nothing executed)
         if grep -qE "Total tests:.*0[^0-9]" "$output_file" 2>/dev/null && \
            ! grep -qE "Passed:[[:space:]]*[1-9]" "$output_file" 2>/dev/null; then
             echo "  ⚠️  No tests executed (exit 0 but 0 tests passed)"
@@ -330,49 +314,45 @@ run_perf_test() {
     date -u '+%Y-%m-%d %H:%M:%S UTC' > "$RESULTS_DIR/${test_id}_completed"
 }
 
-# ----- extract metrics from MeasureFullTableImportRepeated output -----
-# The repeated test runs N iterations and prints a "--- Summary ---"
-# block with avg/min/max/stddev. We pull those plus the per-iteration
-# row count and the avg-throughput string. Single-environment configs
-# only emit one summary block; multi-env configs emit one per env and
-# `head -1` takes the first.
+# ----- extract metadata-path metrics from test output -----
+# The lines being scraped here are written by
+# GetObjectsTest.MeasureGetObjectsRepeated. Keep these regexes in sync
+# with the Log() calls in that test. Output (pipe-separated):
+#   iters | catalogs (avg) | batches (avg) | avg_dur (s) | min_dur | max_dur | stddev | peak_ws
 #
-# NOTE: Each extraction uses `{ sed ... || true; }` to prevent SIGPIPE
-# failures. When `head -1` closes the pipe after the first match, sed
-# receives SIGPIPE and exits with 141. Under `set -o pipefail`, this
-# would propagate as a non-zero pipeline exit, causing `set -e` to
-# abort the entire script mid-write of PERFTESTS.md — truncating the
-# file and losing all accumulated results.
+# Each extraction wraps `sed` in `{ ... || true; }` to swallow SIGPIPE
+# when `head -1` closes the pipe. Without this, `set -o pipefail` would
+# propagate the failure and `set -e` would abort write_perftests_md
+# mid-write, truncating PERFTESTS_METADATA.md.
 parse_test_output() {
     local test_id="$1"
     local output_file="$RESULTS_DIR/${test_id}_output.txt"
 
     if [[ ! -f "$output_file" ]]; then
-        echo "N/A|N/A|N/A|N/A|N/A|N/A|N/A"
+        echo "N/A|N/A|N/A|N/A|N/A|N/A|N/A|N/A"
         return
     fi
 
-    local iters rows avg_dur min_dur max_dur stddev avg_throughput
+    local iters catalogs batches avg_dur min_dur max_dur stddev peak_ws
 
-    # "Iterations: 3"
     iters=$({ sed -n 's/.*Iterations:[[:space:]]*\([0-9]*\).*/\1/p' "$output_file" || true; } | head -1)
-    # Per-iteration line: "  25,034,075 rows, 24.50 GB, 00:47:25.345"
-    rows=$({ sed -n 's/^[[:space:]]*\([0-9,]*\) rows,.*/\1/p' "$output_file" || true; } | head -1)
-    # Summary lines (durations are seconds, e.g. "47.25s")
+    # "  Avg catalogs:  16" — printed with N0 (no decimals), no commas
+    # by F0 format, but allow commas from any other formatter just in case.
+    catalogs=$({ sed -n 's/.*Avg catalogs:[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" || true; } | head -1)
+    batches=$({ sed -n 's/.*Avg batches:[[:space:]]*\([0-9,]*\).*/\1/p' "$output_file" || true; } | head -1)
     avg_dur=$({ sed -n 's/.*Avg duration:[[:space:]]*\([0-9.]*\)s.*/\1/p' "$output_file" || true; } | head -1)
     min_dur=$({ sed -n 's/.*Min duration:[[:space:]]*\([0-9.]*\)s.*/\1/p' "$output_file" || true; } | head -1)
     max_dur=$({ sed -n 's/.*Max duration:[[:space:]]*\([0-9.]*\)s.*/\1/p' "$output_file" || true; } | head -1)
-    # Std deviation is only printed when iterations >= 2
     stddev=$({ sed -n 's/.*Std deviation:[[:space:]]*\([0-9.]*\)s.*/\1/p' "$output_file" || true; } | head -1)
-    # "  Avg throughput:1.32 MB/s" — capture from after the colon to end-of-line
-    avg_throughput=$({ sed -n 's/.*Avg throughput:[[:space:]]*\(.*\)$/\1/p' "$output_file" || true; } | head -1)
+    # "Peak working set: 234.56 MB"
+    peak_ws=$({ sed -n 's/.*Peak working set:[[:space:]]*\([0-9.]*[[:space:]]*[KMGT]\?B\).*/\1/p' "$output_file" || true; } | head -1)
 
-    # Single-iteration runs print no stddev — treat as 0 so the delta
-    # calculation still works (combined uncertainty just collapses to
-    # the baseline's stddev).
+    # Single-iteration runs (shouldn't happen with the Repeated test but
+    # be defensive) print no stddev — treat as 0 so compute_delta_pct
+    # still works.
     : "${stddev:=0}"
 
-    echo "${iters:-N/A}|${rows:-N/A}|${avg_dur:-N/A}|${min_dur:-N/A}|${max_dur:-N/A}|${stddev:-N/A}|${avg_throughput:-N/A}"
+    echo "${iters:-N/A}|${catalogs:-N/A}|${batches:-N/A}|${avg_dur:-N/A}|${min_dur:-N/A}|${max_dur:-N/A}|${stddev:-N/A}|${peak_ws:-N/A}"
 }
 
 # ----- helper: check skip-test list -----
@@ -391,9 +371,9 @@ is_skip_test_patch() {
 # Inputs: baseline_avg, baseline_stddev, patch_avg, patch_stddev (all seconds).
 # Output (stdout): "+5.2% ± 1.8%" / "-3.1% ± 0.9%" / "—" if any input is missing.
 # Sign convention: positive percentage = improvement (patch is faster than
-# baseline). The combined stddev is the L2-norm of the two stddevs as a
-# percentage of the baseline mean (sqrt(σ_b² + σ_p²) / baseline). This is
-# a rough propagation-of-uncertainty estimate, not a formal CI.
+# baseline). Combined stddev is the L2-norm of the two stddevs as a
+# percentage of the baseline mean — rough propagation of uncertainty,
+# not a formal CI. Same implementation as run-perf-suite.sh.
 compute_delta_pct() {
     local baseline_avg="$1"
     local baseline_stddev="${2:-0}"
@@ -430,19 +410,13 @@ status_emoji() {
     esac
 }
 
-# ----- helper: (re)generate PERFTESTS.md from current results -----
-# Called after every test run so the file always reflects the latest state.
-# Tests not yet started appear as ⏳ PENDING.
-#
-# Uses atomic writes: generates content in a temp file, then renames it
-# to the output path. This prevents data loss if the script is killed
-# mid-write (a bare `> file` would truncate first, leaving partial content).
+# ----- helper: (re)generate PERFTESTS_METADATA.md from current results -----
 write_perftests_md() {
     local tmp_file
     tmp_file="$(mktemp "${OUTPUT_FILE}.tmp.XXXXXX")"
 
     # Capture baseline avg/stddev once so every patch row can compute its
-    # Δ vs. baseline. If the baseline didn't run or failed, BASELINE_AVG
+    # Δ vs baseline. If the baseline didn't run or failed, BASELINE_AVG
     # stays empty and compute_delta_pct returns "—" for every patch row.
     local BASELINE_AVG="" BASELINE_STDDEV=""
     if [[ "$SKIP_BASELINE" == false ]]; then
@@ -451,23 +425,22 @@ write_perftests_md() {
         if [[ "$b_status" == "PASSED" ]]; then
             local b_metrics
             b_metrics=$(parse_test_output "baseline")
-            IFS='|' read -r _ _ b_avg _ _ b_stddev _ <<< "$b_metrics"
+            IFS='|' read -r _ _ _ b_avg _ _ b_stddev _ <<< "$b_metrics"
             BASELINE_AVG="$b_avg"
             BASELINE_STDDEV="$b_stddev"
         fi
     fi
 
     {
-        echo "# Performance Test Results"
+        echo "# Metadata Performance Test Results"
         echo ""
         echo "**Commit:** \`$COMMIT_SHA\`"
         echo "**Suite started:** $SUITE_START_TIME"
         echo "**Last updated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "**Patches:** $TOTAL_PATCHES applied incrementally"
         echo "**Cooldown between runs:** ${COOLDOWN_SECS}s"
-        echo "**Test:** \`FullTableImportTest.MeasureFullTableImportRepeated\` (avg of N iterations per row)"
+        echo "**Test:** \`GetObjectsTest.MeasureGetObjectsRepeated\` (depth=All, avg of N iterations per row)"
 
-        # Show preflight connectivity check status if available
         local preflight_status preflight_completed
         preflight_status=$(cat "$RESULTS_DIR/preflight_status" 2>/dev/null || echo "")
         if [[ -n "$preflight_status" ]]; then
@@ -477,15 +450,18 @@ write_perftests_md() {
 
         echo ""
 
-        # Summary table
+        # Summary table — parallel to run-perf-suite.sh's: Iters / Avg /
+        # Stddev / Δ vs Baseline ± stddev. Metadata-specific columns are
+        # Catalogs (workload size) and Peak WS (memory metric for patch
+        # 10). Throughput / row-count not applicable here.
         echo "## Summary"
         echo ""
-        echo "| # | Configuration | Status | Build (s) | Test (s) | Completed | Iters | Rows | Avg (s) | Stddev (s) | Δ vs Baseline ± stddev | Avg Throughput |"
-        echo "|---|--------------|--------|----------|---------|-----------|-------|------|--------|-----------|-----------------------|---------------|"
+        echo "| # | Configuration | Status | Build (s) | Test (s) | Completed | Iters | Catalogs | Avg (s) | Stddev (s) | Δ vs Baseline ± stddev | Peak WS |"
+        echo "|---|--------------|--------|----------|---------|-----------|-------|---------|--------|-----------|-----------------------|--------|"
 
         # Baseline row
         if [[ "$SKIP_BASELINE" == false ]]; then
-            local status completed emoji metrics iters rows avg_dur min_dur max_dur stddev throughput
+            local status completed emoji metrics iters catalogs batches avg_dur min_dur max_dur stddev peak_ws
             local build_time test_time
             status=$(cat "$RESULTS_DIR/baseline_status" 2>/dev/null || echo "PENDING")
             completed=$(cat "$RESULTS_DIR/baseline_completed" 2>/dev/null || echo "-")
@@ -494,15 +470,15 @@ write_perftests_md() {
             emoji=$(status_emoji "$status")
             if [[ "$status" == "PASSED" ]]; then
                 metrics=$(parse_test_output "baseline")
-                IFS='|' read -r iters rows avg_dur min_dur max_dur stddev throughput <<< "$metrics"
-                echo "| 0 | Baseline (no patches) | $emoji $status | $build_time | $test_time | $completed | $iters | $rows | $avg_dur | $stddev | — (reference) | $throughput |"
+                IFS='|' read -r iters catalogs batches avg_dur min_dur max_dur stddev peak_ws <<< "$metrics"
+                echo "| 0 | Baseline (no patches) | $emoji $status | $build_time | $test_time | $completed | $iters | $catalogs | $avg_dur | $stddev | — (reference) | $peak_ws |"
             else
                 echo "| 0 | Baseline (no patches) | $emoji $status | $build_time | $test_time | $completed | - | - | - | - | - | - |"
             fi
         fi
 
         # Patch rows
-        local pi test_id patch_name status completed emoji metrics iters rows avg_dur min_dur max_dur stddev throughput delta_str
+        local pi test_id patch_name status completed emoji metrics iters catalogs batches avg_dur min_dur max_dur stddev peak_ws delta_str
         for ((pi = 0; pi < TOTAL_PATCHES; pi++)); do
             test_id="patch$(printf '%02d' $((pi+1)))"
             patch_name="$(basename "${PATCH_FILES[$pi]}" .patch)"
@@ -514,9 +490,9 @@ write_perftests_md() {
 
             if [[ "$status" == "PASSED" ]]; then
                 metrics=$(parse_test_output "$test_id")
-                IFS='|' read -r iters rows avg_dur min_dur max_dur stddev throughput <<< "$metrics"
+                IFS='|' read -r iters catalogs batches avg_dur min_dur max_dur stddev peak_ws <<< "$metrics"
                 delta_str=$(compute_delta_pct "$BASELINE_AVG" "$BASELINE_STDDEV" "$avg_dur" "$stddev")
-                echo "| $((pi+1)) | +$patch_name | $emoji $status | $build_time | $test_time | $completed | $iters | $rows | $avg_dur | $stddev | $delta_str | $throughput |"
+                echo "| $((pi+1)) | +$patch_name | $emoji $status | $build_time | $test_time | $completed | $iters | $catalogs | $avg_dur | $stddev | $delta_str | $peak_ws |"
             else
                 echo "| $((pi+1)) | +$patch_name | $emoji $status | $build_time | $test_time | $completed | - | - | - | - | - | - |"
             fi
@@ -528,12 +504,11 @@ write_perftests_md() {
         echo "## Detailed Results"
         echo ""
 
-        # Preflight connectivity check
         if [[ -f "$RESULTS_DIR/preflight_output.txt" ]]; then
             local pf_status pf_completed
             pf_status=$(cat "$RESULTS_DIR/preflight_status" 2>/dev/null || echo "N/A")
             pf_completed=$(cat "$RESULTS_DIR/preflight_completed" 2>/dev/null || echo "N/A")
-            echo "### Preflight: Connectivity Check"
+            echo "### Preflight: Metadata Connectivity Check"
             echo ""
             echo "**Status:** $(status_emoji "$pf_status") $pf_status"
             echo "**Completed:** $pf_completed"
@@ -569,7 +544,6 @@ write_perftests_md() {
             test_id="patch$(printf '%02d' $((pi+1)))"
             patch_name="$(basename "${PATCH_FILES[$pi]}" .patch)"
 
-            # Only emit detail section if the test has run
             if [[ -f "$RESULTS_DIR/${test_id}_status" ]]; then
                 echo "### Patch $((pi+1)): $patch_name"
                 echo ""
@@ -595,27 +569,20 @@ write_perftests_md() {
         done
 
         echo "---"
-        echo "*Generated by \`run-perf-suite.sh\` on $(date -u '+%Y-%m-%d %H:%M:%S UTC')*"
+        echo "*Generated by \`run-metadata-perf-suite.sh\` on $(date -u '+%Y-%m-%d %H:%M:%S UTC')*"
 
     } > "$tmp_file"
 
-    # Atomic rename — if this succeeds, the output file is always complete.
-    # If the script is killed before this point, the previous PERFTESTS.md
-    # (from the last successful write) remains intact.
     mv -f "$tmp_file" "$OUTPUT_FILE"
 }
 
 # ----- helper: cooldown between test runs -----
-# Mitigates BigQuery Storage Read API server-side throttling by waiting
-# between consecutive reads. The API dynamically throttles per-connection
-# throughput (via ThrottleState.throttle_percent in ReadRowsResponse) when
-# a project sustains high read volume. A pause lets the throttle dissipate.
 cooldown_between_runs() {
     if [[ "$COOLDOWN_SECS" -le 0 ]]; then
         return
     fi
     echo ""
-    echo "  ⏳ Cooldown: waiting ${COOLDOWN_SECS}s to mitigate BigQuery throttling..."
+    echo "  ⏳ Cooldown: waiting ${COOLDOWN_SECS}s..."
     local remaining=$COOLDOWN_SECS
     while [[ $remaining -gt 0 ]]; do
         printf "\r  ⏳ Cooldown: %3ds remaining..." "$remaining"
@@ -625,10 +592,10 @@ cooldown_between_runs() {
     printf "\r  ✅ Cooldown complete.                    \n"
 }
 
-# ----- preflight: verify BigQuery connectivity -----
+# ----- preflight: verify metadata connectivity -----
 echo ""
 echo "=========================================="
-echo "Preflight: Verifying BigQuery connectivity"
+echo "Preflight: Verifying metadata connectivity"
 echo "=========================================="
 
 preflight_env_args=()
@@ -675,7 +642,7 @@ if ! docker run "${preflight_docker_common[@]}" \
     exit 1
 fi
 
-echo "  Running connectivity check..."
+echo "  Running metadata connectivity check..."
 if docker run "${preflight_docker_common[@]}" \
     -e "BIGQUERY_PERF_CONFIG_FILE=/repo/perfconfig.json" \
     -v "$CONFIG_FILE:/repo/perfconfig.json:ro" \
@@ -684,16 +651,15 @@ if docker run "${preflight_docker_common[@]}" \
         -c Release \
         --no-build \
         --logger "console;verbosity=detailed" \
-        --filter "FullyQualifiedName=AdbcDrivers.BigQuery.Perf.FullTableImportTest.VerifyConnectivity" \
+        --filter "$PREFLIGHT_FILTER" \
     >> "$PREFLIGHT_OUTPUT" 2>&1; then
 
-    echo "  ✅ BigQuery connectivity verified"
+    echo "  ✅ Metadata connectivity verified"
     echo "PASSED" > "$RESULTS_DIR/preflight_status"
 else
-    echo "  ❌ BigQuery connectivity check FAILED"
+    echo "  ❌ Metadata connectivity check FAILED"
     echo ""
-    echo "  Cannot reach BigQuery or authenticate. Aborting suite."
-    echo "  Check credentials, network, and project configuration."
+    echo "  Cannot reach BigQuery metadata APIs or authenticate. Aborting suite."
     echo ""
     echo "--- Preflight output (last 30 lines) ---"
     tail -30 "$PREFLIGHT_OUTPUT"
@@ -709,7 +675,6 @@ if [[ "$SKIP_BASELINE" == false ]]; then
     run_perf_test "Baseline (no patches) @ $COMMIT_SHORT" "baseline"
     write_perftests_md || echo "  ⚠️  Warning: failed to update $OUTPUT_FILE"
     echo "  → $OUTPUT_FILE updated"
-    # Cooldown before the first patch run
     if [[ "$TOTAL_PATCHES" -gt 0 ]]; then
         cooldown_between_runs
     fi
@@ -723,7 +688,6 @@ for ((i = 0; i < TOTAL_PATCHES; i++)); do
     echo ""
     echo "Applying patch $((i+1))/$TOTAL_PATCHES: $patch_name"
 
-    # Apply patch to worktree
     cd "$WORKTREE_DIR"
     if ! git apply --check "$patch_file" 2>/dev/null; then
         echo "  ⚠️  Patch does not apply cleanly with git apply, trying with --3way..."
@@ -751,14 +715,14 @@ for ((i = 0; i < TOTAL_PATCHES; i++)); do
 
     echo "  Patch applied."
 
-    # Filter: if this patch targets the metadata path, skip the
-    # build+test. The patch is already applied above so the cumulative
-    # stack remains canonical 1→N for later tested rows; we just don't
-    # spend a test run measuring something this script can't see.
+    # Filter: if this patch targets the data path, skip the build+test.
+    # The patch is already applied above so the cumulative stack remains
+    # canonical 1→N for later tested rows; we just don't spend a test
+    # run measuring something this script can't see.
     patch_num="${patch_name%%-*}"
     if is_skip_test_patch "$patch_num"; then
         test_id="patch$(printf '%02d' $((i+1)))"
-        echo "  ⏭️  Skipping test — patch targets the metadata path (see run-metadata-perf-suite.sh)"
+        echo "  ⏭️  Skipping test — patch targets the data path (see run-perf-suite.sh)"
         echo "OTHER_PATH" > "$RESULTS_DIR/${test_id}_status"
         date -u '+%Y-%m-%d %H:%M:%S UTC' > "$RESULTS_DIR/${test_id}_completed"
         write_perftests_md || echo "  ⚠️  Warning: failed to update $OUTPUT_FILE"

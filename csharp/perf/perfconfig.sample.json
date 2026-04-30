@@ -10,7 +10,7 @@
             "table": "your_table",
             "maxStreamCount": 0,
             "allowLargeResults": false,
-            "iterations": 3
+            "iterations": 5
         }
     ]
 }

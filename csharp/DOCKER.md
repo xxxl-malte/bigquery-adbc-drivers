@@ -164,7 +164,7 @@ Copy `perf/perfconfig.sample.json` and fill in your details:
             "table": "your_table",
             "maxStreamCount": 0,
             "allowLargeResults": false,
-            "iterations": 3
+            "iterations": 5
         }
     ]
 }
@@ -176,7 +176,7 @@ Copy `perf/perfconfig.sample.json` and fill in your details:
 | `schema` | BigQuery dataset |
 | `table` | Table to import (SELECT *) |
 | `maxStreamCount` | Parallel read streams (`0` = server default) |
-| `iterations` | Number of repeated runs for the `MeasureFullTableImportRepeated` test |
+| `iterations` | Number of repeated runs for the `MeasureFullTableImportRepeated` and `MeasureGetObjectsRepeated` tests (default 5 if unset). The orchestrator scripts use these to compute avg ± stddev and Δ vs baseline. |
 
 ### 2. Set the path in `.env`
 
@@ -269,10 +269,22 @@ cd csharp/
 
 This will:
 1. Create a git worktree at HEAD
-2. Run a baseline perf test (no patches)
-3. Apply patches 01–16 one at a time, running perf tests after each
-4. Wait a cooldown period between runs to mitigate BigQuery throttling
-5. Generate `PERFTESTS.md` with a summary table and detailed results
+2. Run a baseline perf test (no patches), repeated `iterations` times (default 5 — set
+   per environment via `iterations` in `perfconfig.json`)
+3. Apply patches 01–16 one at a time:
+   - Patches whose effects only show on the *metadata path* (01, 02, 08, 09, 10, 13)
+     are applied to keep the canonical stack intact, but their build+test is **skipped**
+     and shown as ⏭️ `OTHER_PATH` in the report. Use `run-metadata-perf-suite.sh` to
+     evaluate those.
+   - All other patches run the repeated perf test on top of the cumulative stack.
+4. Wait a cooldown period between *tested* runs to mitigate BigQuery throttling.
+   The script peeks ahead and skips the cooldown if only filtered patches remain.
+5. Generate `PERFTESTS.md` with:
+   - A summary table including a **Δ vs Baseline ± stddev** column (positive % = patch
+     is faster; the ± figure combines baseline and patch stddev as a rough propagation
+     of uncertainty — not a formal CI).
+   - Per-row detailed sections containing the full test output (per-iteration timings,
+     min/max/avg/stddev, and the driver's throttle stats from `MultiArrowReader`).
 
 ### Options
 
@@ -291,15 +303,19 @@ This will:
 ### Throttle visibility
 
 The BigQuery Storage Read API dynamically throttles per-connection throughput via
-`ThrottleState.throttle_percent` (0–100) in each `ReadRowsResponse`. The driver now
+`ThrottleState.throttle_percent` (0–100) in each `ReadRowsResponse`. The driver
 tracks and reports these stats after each data transfer:
 
 - **Max throttle** — highest throttle % seen across all batches/streams
 - **Avg throttle** — mean throttle % across all batches
 - **Batches throttled** — count and percentage of batches with non-zero throttle
 
-These appear in the test output and are included in the PERFTESTS.md summary table.
-Use `--cooldown` to add a pause between runs to let throttling dissipate.
+These appear in the per-row detailed sections of `PERFTESTS.md` (full test output)
+but are **no longer columns in the summary table**: with `MeasureFullTableImportRepeated`
+running multiple iterations per row, throttle stats are emitted once per iteration and
+don't aggregate cleanly into a single number. Use `--cooldown` (default 60 s) to give
+throttle state time to dissipate between rows; if you see suspicious deltas, inspect
+the per-iteration throttle in the row's detail section.
 
 ### Credential handling
 
@@ -315,6 +331,44 @@ To set up ADC credentials:
 gcloud auth application-default login --scopes=https://www.googleapis.com/auth/bigquery
 ```
 
+#### Running on a GCP VM
+
+If running the perf scripts on a GCP VM (e.g. the `terraform/` setup) you may hit:
+
+```
+InvalidOperationException: No JSON credential provided in config and
+GOOGLE_APPLICATION_CREDENTIALS environment variable is not set or file does not exist.
+```
+
+The perf test code (`perf/FullTableImportTest.cs`) only accepts a service-account
+JSON credential — either inline as `jsonCredential` in `perfconfig.json`, or via a
+file path in `GOOGLE_APPLICATION_CREDENTIALS`. Two important caveats on a VM:
+
+- **The VM's attached service account / instance metadata server is not used.**
+  The driver is invoked with `auth_type=service` + `auth_json_credential=<JSON>`;
+  there is no metadata-server fallback path.
+- **`gcloud auth application-default login` on the VM does not help.** It produces
+  a *user* credential JSON (with `refresh_token` / `client_id`), which the
+  `service` auth path will not accept. ADC works on your local Mac only because
+  the script happens to find that file there — it does not mean the credential
+  itself is compatible if the test ever needs to fall through.
+
+To run on the VM, pick one of:
+
+**Upload a service-account key and export the env var:**
+
+```sh
+# on the VM
+export GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/sa-key.json
+./csharp/scripts/run-perf-suite.sh --config ./csharp/perf/perfconfig.json
+```
+
+**Inline the service-account JSON into `perfconfig.json`:**
+
+Set the `jsonCredential` field to the full service-account JSON (escaped as a
+single string per `perfconfig.sample.json`). The script then needs no host
+credentials at all.
+
 ### Running a single commit
 
 To benchmark any arbitrary commit without the patch suite:
@@ -325,6 +379,57 @@ To benchmark any arbitrary commit without the patch suite:
   --commit abc1234 \
   --append-to ./PERFTESTS.md
 ```
+
+### Metadata-path suite (`run-metadata-perf-suite.sh`)
+
+The data-path suite above (`run-perf-suite.sh`, calling
+`MeasureFullTableImportRepeated`) does not enter the schema-discovery
+code: `Connection.GetObjects` and the `INFORMATION_SCHEMA` queries it
+fans out to. Patches that target those paths — currently 01, 02, 08,
+09, 10, 13 — are filtered out (shown as ⏭️ `OTHER_PATH`) by
+`run-perf-suite.sh`. Use the metadata-path suite to evaluate them:
+
+```sh
+cd csharp/
+./scripts/run-metadata-perf-suite.sh --config ./secrets/perfconfig.json
+```
+
+Same options, same patch directory, same architecture as
+`run-perf-suite.sh`. The two scripts apply a **symmetric filter** — each
+applies all 16 patches (the canonical stack is preserved), but each
+only runs the build+test for patches that affect *its* path:
+
+| Script | Tests | Filters out (`OTHER_PATH`) |
+|---|---|---|
+| `run-perf-suite.sh` | data-path + shared (03, 04, 05, 06, 07, 11, 12, 14, 15, 16) | metadata-only (01, 02, 08, 09, 10, 13) |
+| `run-metadata-perf-suite.sh` | metadata-path + shared (01, 02, 03, 04, 05, 08, 09, 10, 13, 14) | data-only (06, 07, 11, 12, 15, 16) |
+
+Other differences for the metadata script:
+
+- **Test:** `GetObjectsTest.MeasureGetObjectsRepeated` (`depth=All`,
+  bounded by `catalog` and `schema` from the config — leave both empty
+  to crawl the whole account; iterations from `perfconfig.json`,
+  default 5).
+- **Output:** `PERFTESTS_METADATA.md`.
+- **Default cooldown:** 30 s (no Storage Read API throttling to worry
+  about).
+- **Summary columns:** `Iters | Catalogs | Avg (s) | Stddev (s) | Δ vs
+  Baseline ± stddev | Peak WS`. The `Δ` column uses the same propagation
+  -of-uncertainty formula as `run-perf-suite.sh`. Per-iteration timings,
+  GetObjects time, and time-to-first-batch are still in the per-row
+  detail sections (full test output).
+- **No throughput / row-count columns** — those concepts don't apply to
+  schema discovery the same way they do to a table import.
+
+Patch-visibility cheat sheet for picking a target dataset:
+
+| Patch | Visible when … |
+|---|---|
+| 09 (batch INFORMATION_SCHEMA) | dataset has many tables (≥ ~50) |
+| 08 (parallel GetObjects) | catalog has many datasets |
+| 10 (streaming GetObjects) | crawling many catalogs (`Peak WS` column) |
+| 02 (parameterized queries) | many table/column lookups in one call |
+| 01, 13 (regex fixes) | `catalog`/`schema` patterns contain wildcards |
 
 ### Patch order
 

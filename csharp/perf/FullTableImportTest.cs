@@ -246,7 +246,7 @@ namespace AdbcDrivers.BigQuery.Perf
         {
             foreach (PerfTestEnvironment env in _environments)
             {
-                int iterations = env.Iterations > 0 ? env.Iterations : 3;
+                int iterations = env.Iterations > 0 ? env.Iterations : 5;
 
                 _output.WriteLine("==========================================================");
                 _output.WriteLine($"Environment: {env.Name}");
@@ -317,7 +317,7 @@ namespace AdbcDrivers.BigQuery.Perf
             }
         }
 
-        private static Dictionary<string, string> BuildParameters(PerfTestEnvironment env)
+        internal static Dictionary<string, string> BuildParameters(PerfTestEnvironment env)
         {
             Dictionary<string, string> parameters = new Dictionary<string, string>();
 
