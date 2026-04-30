@@ -83,7 +83,7 @@ namespace AdbcDrivers.BigQuery.Perf
 
                     long catalogs = 0;
                     using (IArrowArrayStream stream = connection.GetObjects(
-                        depth: GetObjectsDepth.Catalogs,
+                        depth: AdbcConnection.GetObjectsDepth.Catalogs,
                         catalogPattern: NullIfEmpty(env.Catalog),
                         dbSchemaPattern: null,
                         tableNamePattern: null,
@@ -156,7 +156,7 @@ namespace AdbcDrivers.BigQuery.Perf
                 int columnCount = 0;
 
                 using (IArrowArrayStream stream = connection.GetObjects(
-                    depth: GetObjectsDepth.All,
+                    depth: AdbcConnection.GetObjectsDepth.All,
                     catalogPattern: NullIfEmpty(env.Catalog),
                     dbSchemaPattern: NullIfEmpty(env.Schema),
                     tableNamePattern: null,
@@ -269,7 +269,7 @@ namespace AdbcDrivers.BigQuery.Perf
 
                     Stopwatch sw = Stopwatch.StartNew();
                     using (IArrowArrayStream stream = connection.GetObjects(
-                        depth: GetObjectsDepth.All,
+                        depth: AdbcConnection.GetObjectsDepth.All,
                         catalogPattern: NullIfEmpty(env.Catalog),
                         dbSchemaPattern: NullIfEmpty(env.Schema),
                         tableNamePattern: null,
