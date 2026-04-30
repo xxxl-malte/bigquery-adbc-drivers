@@ -248,11 +248,17 @@ namespace AdbcDrivers.BigQuery.Perf
             {
                 int iterations = env.Iterations > 0 ? env.Iterations : 5;
 
-                _output.WriteLine("==========================================================");
-                _output.WriteLine($"Environment: {env.Name}");
-                _output.WriteLine($"Table: {env.Catalog}.{env.Schema}.{env.Table}");
-                _output.WriteLine($"Iterations: {iterations}");
-                _output.WriteLine("==========================================================");
+                // Log() writes to both ITestOutputHelper and Console.Error so the
+                // run-perf-suite.sh parser sees these lines verbatim regardless of
+                // xunit logger verbosity. Without this, the summary lines (Avg
+                // duration, Std deviation, ...) would only reach the captured
+                // output via the console logger surfacing _output messages, which
+                // is the one fragile link in the parsing chain.
+                Log("==========================================================");
+                Log($"Environment: {env.Name}");
+                Log($"Table: {env.Catalog}.{env.Schema}.{env.Table}");
+                Log($"Iterations: {iterations}");
+                Log("==========================================================");
 
                 List<double> durations = new List<double>();
                 List<long> rowCounts = new List<long>();
@@ -260,7 +266,7 @@ namespace AdbcDrivers.BigQuery.Perf
 
                 for (int i = 0; i < iterations; i++)
                 {
-                    _output.WriteLine($"--- Run {i + 1}/{iterations} ---");
+                    Log($"--- Run {i + 1}/{iterations} ---");
 
                     Dictionary<string, string> parameters = BuildParameters(env);
                     AdbcDatabase database = new BigQueryDriver().Open(parameters);
@@ -293,27 +299,27 @@ namespace AdbcDrivers.BigQuery.Perf
                     rowCounts.Add(totalRows);
                     byteCounts.Add(totalBytes);
 
-                    _output.WriteLine($"  {totalRows:N0} rows, {FormatBytes(totalBytes)}, {sw.Elapsed}");
+                    Log($"  {totalRows:N0} rows, {FormatBytes(totalBytes)}, {sw.Elapsed}");
                 }
 
-                _output.WriteLine("");
-                _output.WriteLine("--- Summary ---");
-                _output.WriteLine($"  Avg duration:  {durations.Average():F2}s");
-                _output.WriteLine($"  Min duration:  {durations.Min():F2}s");
-                _output.WriteLine($"  Max duration:  {durations.Max():F2}s");
+                Log("");
+                Log("--- Summary ---");
+                Log($"  Avg duration:  {durations.Average():F2}s");
+                Log($"  Min duration:  {durations.Min():F2}s");
+                Log($"  Max duration:  {durations.Max():F2}s");
                 if (durations.Count > 1)
                 {
                     double mean = durations.Average();
                     double stddev = Math.Sqrt(durations.Select(d => (d - mean) * (d - mean)).Sum() / (durations.Count - 1));
-                    _output.WriteLine($"  Std deviation: {stddev:F2}s");
+                    Log($"  Std deviation: {stddev:F2}s");
                 }
                 double avgBytes = byteCounts.Average();
                 double avgDuration = durations.Average();
                 if (avgDuration > 0)
                 {
-                    _output.WriteLine($"  Avg throughput:{FormatBytes((long)(avgBytes / avgDuration))}/s");
+                    Log($"  Avg throughput:{FormatBytes((long)(avgBytes / avgDuration))}/s");
                 }
-                _output.WriteLine("==========================================================");
+                Log("==========================================================");
             }
         }
 

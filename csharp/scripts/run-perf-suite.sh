@@ -356,8 +356,11 @@ parse_test_output() {
 
     # "Iterations: 3"
     iters=$({ sed -n 's/.*Iterations:[[:space:]]*\([0-9]*\).*/\1/p' "$output_file" || true; } | head -1)
-    # Per-iteration line: "  25,034,075 rows, 24.50 GB, 00:47:25.345"
-    rows=$({ sed -n 's/^[[:space:]]*\([0-9,]*\) rows,.*/\1/p' "$output_file" || true; } | head -1)
+    # Per-iteration line: "  25,034,075 rows, 24.50 GB, 00:47:25.345".
+    # The leading character before the number must be a non-digit/non-comma so
+    # we anchor at a real number boundary; this also tolerates any prefix
+    # injected by the xunit console logger.
+    rows=$({ sed -n 's/.*[^0-9,]\([0-9][0-9,]*\) rows,.*/\1/p' "$output_file" || true; } | head -1)
     # Summary lines (durations are seconds, e.g. "47.25s")
     avg_dur=$({ sed -n 's/.*Avg duration:[[:space:]]*\([0-9.]*\)s.*/\1/p' "$output_file" || true; } | head -1)
     min_dur=$({ sed -n 's/.*Min duration:[[:space:]]*\([0-9.]*\)s.*/\1/p' "$output_file" || true; } | head -1)
