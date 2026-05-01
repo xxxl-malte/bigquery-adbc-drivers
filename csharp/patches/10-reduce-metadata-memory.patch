@@ -33,11 +33,11 @@ index fa80f14..ca89b71 100644
 +                        // Shallow: return all catalogs in a single batch (no per-catalog queries)
 +                        IArrowArray[] dataArrays = GetCatalogs(depth, catalogPattern, dbSchemaPattern,
 +                            tableNamePattern, tableTypes, columnNamePattern);
-+                        return new BigQueryInfoArrowStream(StandardSchemas.GetObjectsSchema, dataArrays);
++                        return (IArrowArrayStream)new BigQueryInfoArrowStream(StandardSchemas.GetObjectsSchema, dataArrays);
 +                    }
 +
 +                    // Streaming: yield one RecordBatch per catalog for true memory reduction
-+                    return new ChunkedGetObjectsStream(
++                    return (IArrowArrayStream)new ChunkedGetObjectsStream(
 +                        this, depth, matchingCatalogIds,
 +                        dbSchemaPattern, tableNamePattern, tableTypes, columnNamePattern);
                  }
@@ -92,10 +92,10 @@ diff --git a/csharp/src/BigQueryInfoArrowStream.cs b/csharp/src/BigQueryInfoArro
 index 41eac78..8182df5 100644
 --- a/csharp/src/BigQueryInfoArrowStream.cs
 +++ b/csharp/src/BigQueryInfoArrowStream.cs
-@@ -21,11 +21,14 @@
+@@ -21,11 +21,15 @@
  * limitations under the License.
  */
- 
+
 +using System;
  using System.Collections.Generic;
  using System.Threading;
@@ -104,10 +104,11 @@ index 41eac78..8182df5 100644
  using Apache.Arrow.Ipc;
 +using Apache.Arrow.Types;
 +using Apache.Arrow.Adbc;
- 
++using Apache.Arrow.Adbc.Extensions;
+
  namespace AdbcDrivers.BigQuery
  {
-@@ -58,4 +61,91 @@ namespace AdbcDrivers.BigQuery
+@@ -58,4 +62,91 @@ namespace AdbcDrivers.BigQuery
              this.batch = null;
          }
      }

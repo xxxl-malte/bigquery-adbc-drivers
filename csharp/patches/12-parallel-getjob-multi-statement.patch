@@ -6,8 +6,8 @@ Parallelize GetJob calls for multi-statement queries.
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 
 ---
- csharp/src/BigQueryStatement.cs | 17 +++++++++++------
- 1 file changed, 11 insertions(+), 6 deletions(-)
+ csharp/src/BigQueryStatement.cs | 18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
 
 diff --git a/csharp/src/BigQueryStatement.cs b/csharp/src/BigQueryStatement.cs
 index f44f9a9..8e73e1f 100644
@@ -16,7 +16,7 @@ index f44f9a9..8e73e1f 100644
 @@ -228,17 +228,22 @@ namespace AdbcDrivers.BigQuery
                          evaluationKind = evaluationKindString;
                      }
- 
+
 -                    Task<BigQueryResults> getMultiJobResults()
 +                    async Task<BigQueryResults> getMultiJobResults()
                      {
@@ -40,5 +40,14 @@ index f44f9a9..8e73e1f 100644
 +                            .Where(j => string.IsNullOrEmpty(statementType) || j.Statistics.Query.StatementType.Equals(statementType, StringComparison.OrdinalIgnoreCase))
 +                            .OrderBy(j => j.Resource.Statistics.CreationTime)
                              .ToList();
- 
+
                          if (joblist.Count > 0)
+@@ -249,7 +254,7 @@ namespace AdbcDrivers.BigQuery
+                             }
+                             BigQueryJob indexedJob = joblist[statementIndex - 1];
+                             cancellationContext.Job = indexedJob;
+-                            return ExecuteCancellableJobAsync(cancellationContext, activity, (context, jobActivity) =>
++                            return await ExecuteCancellableJobAsync(cancellationContext, activity, (context, jobActivity) =>
+                             {
+                                 jobActivity?.AddEvent("getqueryresults_started", [new("job.id", indexedJob.Reference.JobId)]);
+                                 var results = indexedJob.GetQueryResultsAsync(getQueryResultsOptions, cancellationToken: context.CancellationToken);
