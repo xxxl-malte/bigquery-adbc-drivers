@@ -142,6 +142,18 @@ namespace AdbcDrivers.BigQuery
             }
         }
 
+        public override async ValueTask<QueryResult> ExecuteQueryAsync()
+        {
+            try
+            {
+                return await ExecuteQueryInternalAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (BigQueryConnection.IsUnauthorizedException(ex, out GoogleApiException? googleEx))
+            {
+                throw new AdbcException(googleEx!.Message, AdbcStatusCode.Unauthorized, ex);
+            }
+        }
+
         private async Task<QueryResult> ExecuteQueryInternalAsync()
         {
             return await this.TraceActivityAsync(async activity =>
@@ -192,12 +204,8 @@ namespace AdbcDrivers.BigQuery
 
                 BigQueryResults results = await ExecuteWithRetriesAsync(getJobResults, activity, cancellationContext.CancellationToken).ConfigureAwait(false);
 
-                TokenProtectedReadClientManger clientMgr = new TokenProtectedReadClientManger(Credential);
-                clientMgr.UpdateToken = () => Task.Run(() =>
-                {
-                    this.bigQueryConnection.SetCredential();
-                    clientMgr.UpdateCredential(Credential);
-                });
+                TokenProtectedReadClientManger clientMgr = this.bigQueryConnection.ReadClientManager
+                    ?? throw new AdbcException("ReadClientManager is not initialized. Ensure the connection is open.", AdbcStatusCode.InvalidState);
 
                 // For multi-statement queries, StatementType == "SCRIPT"
                 if (results.TableReference == null || job.Statistics.Query.StatementType.Equals("SCRIPT", StringComparison.OrdinalIgnoreCase))
@@ -220,17 +228,22 @@ namespace AdbcDrivers.BigQuery
                         evaluationKind = evaluationKindString;
                     }
 
-                    Task<BigQueryResults> getMultiJobResults()
+                    async Task<BigQueryResults> getMultiJobResults()
                     {
                         // To get the results of all statements in a multi-statement query, enumerate the child jobs. Related public docs: https://cloud.google.com/bigquery/docs/multi-statement-queries#get_all_executed_statements.
                         // Can filter by StatementType and EvaluationKind. Related public docs: https://cloud.google.com/bigquery/docs/reference/rest/v2/Job#jobstatistics2, https://cloud.google.com/bigquery/docs/reference/rest/v2/Job#evaluationkind
                         ListJobsOptions listJobsOptions = new ListJobsOptions();
                         listJobsOptions.ParentJobId = results.JobReference.JobId;
-                        var joblist = Client.ListJobs(listJobsOptions)
-                            .Select(job => Client.GetJob(job.Reference))
-                            .Where(job => string.IsNullOrEmpty(evaluationKind) || job.Statistics.ScriptStatistics.EvaluationKind.Equals(evaluationKind, StringComparison.OrdinalIgnoreCase))
-                            .Where(job => string.IsNullOrEmpty(statementType) || job.Statistics.Query.StatementType.Equals(statementType, StringComparison.OrdinalIgnoreCase))
-                            .OrderBy(job => job.Resource.Statistics.CreationTime)
+
+                        // Fetch all child job details in parallel instead of sequentially
+                        var childJobRefs = Client.ListJobs(listJobsOptions).ToList();
+                        var getJobTasks = childJobRefs.Select(j => Client.GetJobAsync(j.Reference)).ToArray();
+                        BigQueryJob[] allJobs = await Task.WhenAll(getJobTasks).ConfigureAwait(false);
+
+                        var joblist = allJobs
+                            .Where(j => string.IsNullOrEmpty(evaluationKind) || j.Statistics.ScriptStatistics.EvaluationKind.Equals(evaluationKind, StringComparison.OrdinalIgnoreCase))
+                            .Where(j => string.IsNullOrEmpty(statementType) || j.Statistics.Query.StatementType.Equals(statementType, StringComparison.OrdinalIgnoreCase))
+                            .OrderBy(j => j.Resource.Statistics.CreationTime)
                             .ToList();
 
                         if (joblist.Count > 0)
@@ -241,7 +254,7 @@ namespace AdbcDrivers.BigQuery
                             }
                             BigQueryJob indexedJob = joblist[statementIndex - 1];
                             cancellationContext.Job = indexedJob;
-                            return ExecuteCancellableJobAsync(cancellationContext, activity, (context, jobActivity) =>
+                            return await ExecuteCancellableJobAsync(cancellationContext, activity, (context, jobActivity) =>
                             {
                                 jobActivity?.AddEvent("getqueryresults_started", [new("job.id", indexedJob.Reference.JobId)]);
                                 var results = indexedJob.GetQueryResultsAsync(getQueryResultsOptions, cancellationToken: context.CancellationToken);
@@ -726,7 +739,18 @@ namespace AdbcDrivers.BigQuery
             Activity? activity,
             CancellationToken cancellationToken = default)
         {
-            ReadSession rs = new ReadSession { Table = table, DataFormat = DataFormat.Arrow };
+            ReadSession rs = new ReadSession
+            {
+                Table = table,
+                DataFormat = DataFormat.Arrow,
+                ReadOptions = new ReadSession.Types.TableReadOptions
+                {
+                    ArrowSerializationOptions = new ArrowSerializationOptions
+                    {
+                        BufferCompression = ArrowSerializationOptions.Types.CompressionCodec.Lz4Frame
+                    }
+                }
+            };
             BigQueryReadClient bigQueryReadClient = clientMgr.ReadClient;
             activity?.AddEvent("create_read_session_started");
             ReadSession rrs = await bigQueryReadClient.CreateReadSessionAsync("projects/" + projectId, rs, maxStreamCount);
@@ -753,6 +777,18 @@ namespace AdbcDrivers.BigQuery
             try
             {
                 return ExecuteUpdateInternalAsync().GetAwaiter().GetResult();
+            }
+            catch (Exception ex) when (BigQueryConnection.IsUnauthorizedException(ex, out GoogleApiException? googleEx))
+            {
+                throw new AdbcException(googleEx!.Message, AdbcStatusCode.Unauthorized, ex);
+            }
+        }
+
+        public override async Task<UpdateResult> ExecuteUpdateAsync()
+        {
+            try
+            {
+                return await ExecuteUpdateInternalAsync().ConfigureAwait(false);
             }
             catch (Exception ex) when (BigQueryConnection.IsUnauthorizedException(ex, out GoogleApiException? googleEx))
             {
@@ -937,6 +973,8 @@ namespace AdbcDrivers.BigQuery
                     {
                         options.ProjectId = firstProjectId;
                         activity?.AddBigQueryTag("detected_client_project_id", firstProjectId);
+                        // Persist the detected project ID so UpdateClientToken can reuse it
+                        this.bigQueryConnection.PersistProperty(BigQueryParameters.ProjectId, firstProjectId);
                         // need to reopen the Client with the projectId specified
                         this.bigQueryConnection.Open(firstProjectId);
                     }
@@ -1094,8 +1132,10 @@ namespace AdbcDrivers.BigQuery
 
         public bool TokenRequiresUpdate(Exception ex) => BigQueryUtils.TokenRequiresUpdate(ex);
 
+        private int RetryTotalTimeoutMs => this.bigQueryConnection.RetryTotalTimeoutMs;
+
         private async Task<T> ExecuteWithRetriesAsync<T>(Func<Task<T>> action, Activity? activity, CancellationToken cancellationToken = default) =>
-            await RetryManager.ExecuteWithRetriesAsync<T>(this, action, activity, MaxRetryAttempts, RetryDelayMs, cancellationToken);
+            await RetryManager.ExecuteWithRetriesAsync<T>(this, action, activity, MaxRetryAttempts, RetryDelayMs, RetryTotalTimeoutMs, cancellationToken);
 
         private async Task<T> ExecuteCancellableJobAsync<T>(
             JobCancellationContext context,
@@ -1263,7 +1303,7 @@ namespace AdbcDrivers.BigQuery
             }
         }
 
-        private class MultiArrowReader : TracingReader
+        private class MultiArrowReader : TracingReader, IAsyncDisposable
         {
             private const string ClassName = BigQueryStatement.ClassName + ".MultiArrowReader";
             private const int DefaultMaxConcurrency = 10;
@@ -1280,7 +1320,7 @@ namespace AdbcDrivers.BigQuery
             long memoryAtStart;
             long peakMemory;
             long totalBatchesRead;
-            bool disposed;
+            int _disposed;
 
             public MultiArrowReader(BigQueryStatement statement, Schema schema, IEnumerable<IArrowReader> readers, CancellationContext cancellationContext, int maxConcurrency = 0) : base(statement)
             {
@@ -1449,23 +1489,64 @@ namespace AdbcDrivers.BigQuery
             {
                 if (disposing)
                 {
-                    if (!this.disposed)
+                    if (Interlocked.Exchange(ref _disposed, 1) == 0)
                     {
                         this.linkedCts.Cancel();
                         try { this.producerTask?.GetAwaiter().GetResult(); } catch { /* producers reported errors via channel */ }
                         foreach (var reader in this.readerList)
                         {
-                            if (reader is IDisposable d) d.Dispose();
+                            if (reader is IAsyncDisposable ad)
+                            {
+                                // Best-effort sync dispose with timeout
+                                try { ad.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(5)); } catch { }
+                            }
+                            else if (reader is IDisposable d)
+                            {
+                                d.Dispose();
+                            }
                         }
                         this.linkedCts.Dispose();
                         this.concurrencyGate.Dispose();
                         this.cancellationContext.Dispose();
-                        this.disposed = true;
                     }
                 }
 
                 base.Dispose(disposing);
             }
+
+            public async ValueTask DisposeAsyncCore()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                {
+                    this.linkedCts.Cancel();
+                    if (this.producerTask != null)
+                    {
+                        try { await this.producerTask.ConfigureAwait(false); } catch { }
+                    }
+                    foreach (var reader in this.readerList)
+                    {
+                        if (reader is IAsyncDisposable ad)
+                        {
+                            await ad.DisposeAsync().ConfigureAwait(false);
+                        }
+                        else if (reader is IDisposable d)
+                        {
+                            d.Dispose();
+                        }
+                    }
+                    this.linkedCts.Dispose();
+                    this.concurrencyGate.Dispose();
+                    this.cancellationContext.Dispose();
+                }
+            }
+
+            public async ValueTask DisposeAsync()
+            {
+                await DisposeAsyncCore().ConfigureAwait(false);
+                Dispose(false);
+                GC.SuppressFinalize(this);
+            }
+
 
             private static void InterlockedMax(ref long location, long value)
             {
@@ -1479,7 +1560,7 @@ namespace AdbcDrivers.BigQuery
             }
         }
 
-        sealed class ReadRowsStream : IArrowArrayStream
+        sealed class ReadRowsStream : IArrowArrayStream, IAsyncDisposable
         {
             readonly IActivityTracer tracer;
             readonly TokenProtectedReadClientManger clientMgr;
@@ -1491,7 +1572,7 @@ namespace AdbcDrivers.BigQuery
             IAsyncEnumerator<ReadRowsResponse>? response;
             long rowsRead;
             bool initialized;
-            bool disposed;
+            int _disposed;
 
             // Throttle tracking — updated on every batch from ThrottleState
             int maxThrottlePercent;
@@ -1571,7 +1652,7 @@ namespace AdbcDrivers.BigQuery
             {
                 return await this.tracer.TraceActivityAsync(async activity =>
                 {
-                    if (this.disposed || this.response == null)
+                    if (this._disposed != 0 || this.response == null)
                     {
                         return false;
                     }
@@ -1716,10 +1797,24 @@ namespace AdbcDrivers.BigQuery
 
             public void Dispose()
             {
-                if (!this.disposed)
+                if (Interlocked.Exchange(ref _disposed, 1) == 0)
                 {
-                    this.response?.DisposeAsync().GetAwaiter().GetResult();
-                    this.disposed = true;
+                    if (this.response != null)
+                    {
+                        // Best-effort sync dispose — fire and forget
+                        try { this.response.DisposeAsync().AsTask().Wait(TimeSpan.FromSeconds(5)); } catch { }
+                    }
+                }
+            }
+
+            public async ValueTask DisposeAsync()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                {
+                    if (this.response != null)
+                    {
+                        await this.response.DisposeAsync().ConfigureAwait(false);
+                    }
                 }
             }
         }

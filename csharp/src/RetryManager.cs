@@ -41,6 +41,7 @@ namespace AdbcDrivers.BigQuery
             Activity? activity,
             int maxRetries = 5,
             int initialDelayMilliseconds = 200,
+            int totalTimeoutMilliseconds = 0,
             CancellationToken cancellationToken = default)
         {
             if (action == null)
@@ -52,9 +53,18 @@ namespace AdbcDrivers.BigQuery
             int tokenRefreshAttempts = 0;
             int maxAttempts = maxRetries + 1; // maxRetries=0 means 1 attempt, maxRetries=5 means 6 attempts
             int delay = initialDelayMilliseconds;
+            Stopwatch? totalTimer = totalTimeoutMilliseconds > 0 ? Stopwatch.StartNew() : null;
 
             while (attempt < maxAttempts)
             {
+                // Check wall-clock deadline before each attempt
+                if (totalTimer != null && totalTimer.ElapsedMilliseconds >= totalTimeoutMilliseconds)
+                {
+                    throw new AdbcException(
+                        $"Operation timed out after {totalTimer.ElapsedMilliseconds}ms (budget: {totalTimeoutMilliseconds}ms) with {attempt} attempt(s)",
+                        AdbcStatusCode.Timeout);
+                }
+
                 try
                 {
                     T result = await action();
@@ -110,7 +120,15 @@ namespace AdbcDrivers.BigQuery
                         activity?.AddBigQueryTag("update_token.status", "Completed");
                     }
 
-                    await Task.Delay(delay, cancellationToken);
+                    // Clamp delay to remaining time budget
+                    int effectiveDelay = delay;
+                    if (totalTimer != null)
+                    {
+                        long remaining = totalTimeoutMilliseconds - totalTimer.ElapsedMilliseconds;
+                        if (remaining <= 0) continue; // will hit timeout check at top of loop
+                        effectiveDelay = (int)Math.Min(delay, remaining);
+                    }
+                    await Task.Delay(effectiveDelay, cancellationToken);
                     delay = Math.Min(2 * delay, 5000);
                 }
             }

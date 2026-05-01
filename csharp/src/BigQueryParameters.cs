@@ -56,6 +56,8 @@ namespace AdbcDrivers.BigQuery
         public const string ProjectId = "adbc.bigquery.project_id";
         public const string RefreshToken = "adbc.bigquery.refresh_token";
         public const string RetryDelayMs = "adbc.bigquery.retry_delay_ms";
+        public const string RetryTotalTimeoutMs = "adbc.bigquery.retry_total_timeout_ms";
+        public const string MetadataBatchSize = "adbc.bigquery.metadata_batch_size";
         public const string Scopes = "adbc.bigquery.scopes";
         public const string StatementIndex = "adbc.bigquery.multiple_statement.statement_index";
         public const string StatementType = "adbc.bigquery.multiple_statement.statement_type";

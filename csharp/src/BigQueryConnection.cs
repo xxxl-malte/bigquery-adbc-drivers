@@ -125,6 +125,16 @@ namespace AdbcDrivers.BigQuery
                 throw new ArgumentException($"The value '{sRetryDelay}' for parameter '{BigQueryParameters.RetryDelayMs}' is not a valid non-negative integer.");
             }
 
+            if (this.properties.TryGetValue(BigQueryParameters.RetryTotalTimeoutMs, out string? sTotalTimeout) &&
+                int.TryParse(sTotalTimeout, out int totalTimeout) && totalTimeout >= 0)
+            {
+                RetryTotalTimeoutMs = totalTimeout;
+            }
+            else if (sTotalTimeout != null)
+            {
+                throw new ArgumentException($"The value '{sTotalTimeout}' for parameter '{BigQueryParameters.RetryTotalTimeoutMs}' is not a valid non-negative integer.");
+            }
+
             if (this.properties.TryGetValue(BigQueryParameters.DefaultClientLocation, out string? location) &&
                 !string.IsNullOrEmpty(location) &&
                 BigQueryConstants.ValidLocations.Any(l => l.Equals(location, StringComparison.OrdinalIgnoreCase)))
@@ -178,6 +188,8 @@ namespace AdbcDrivers.BigQuery
         internal BigQueryClient? Client { get; private set; }
 
         internal GoogleCredential? Credential { get; private set; }
+
+        internal TokenProtectedReadClientManger? ReadClientManager { get; private set; }
 
         internal int MaxRetryAttempts { get; private set; } = 5;
 
@@ -406,6 +418,23 @@ namespace AdbcDrivers.BigQuery
                 }
 
                 Client = client;
+
+                // Create or update the shared gRPC read client
+                if (ReadClientManager == null)
+                {
+                    ReadClientManager = new TokenProtectedReadClientManger(Credential!);
+                    var mgr = ReadClientManager;
+                    mgr.UpdateToken = () => Task.Run(() =>
+                    {
+                        SetCredential();
+                        mgr.UpdateCredential(Credential);
+                    });
+                }
+                else
+                {
+                    ReadClientManager.UpdateCredential(Credential!);
+                }
+
                 return client;
             }, ClassName + "." + nameof(Open));
         }
@@ -669,10 +698,20 @@ namespace AdbcDrivers.BigQuery
             {
                 try
                 {
-                    IArrowArray[] dataArrays = GetCatalogs(depth, catalogPattern, dbSchemaPattern,
-                        tableNamePattern, tableTypes, columnNamePattern);
+                    List<string> matchingCatalogIds = GetMatchingCatalogIds(catalogPattern, activity);
 
-                    return new BigQueryInfoArrowStream(StandardSchemas.GetObjectsSchema, dataArrays);
+                    if (depth == GetObjectsDepth.Catalogs)
+                    {
+                        // Shallow: return all catalogs in a single batch (no per-catalog queries)
+                        IArrowArray[] dataArrays = GetCatalogs(depth, catalogPattern, dbSchemaPattern,
+                            tableNamePattern, tableTypes, columnNamePattern);
+                        return (IArrowArrayStream)new BigQueryInfoArrowStream(StandardSchemas.GetObjectsSchema, dataArrays);
+                    }
+
+                    // Streaming: yield one RecordBatch per catalog for true memory reduction
+                    return (IArrowArrayStream)new ChunkedGetObjectsStream(
+                        this, depth, matchingCatalogIds,
+                        dbSchemaPattern, tableNamePattern, tableTypes, columnNamePattern);
                 }
                 catch (Exception ex) when (IsUnauthorizedException(ex, out GoogleApiException? googleEx))
                 {
@@ -682,12 +721,86 @@ namespace AdbcDrivers.BigQuery
         }
 
         /// <summary>
+        /// Lists project IDs matching the catalog pattern, with retry logic.
+        /// </summary>
+        private List<string> GetMatchingCatalogIds(string? catalogPattern, System.Diagnostics.Activity? activity)
+        {
+            string catalogRegexp = PatternToRegEx(catalogPattern);
+
+            Func<Task<PagedEnumerable<ProjectList, CloudProject>?>> func = () => Task.Run(() =>
+            {
+                return Client?.ListProjects();
+            });
+
+            PagedEnumerable<ProjectList, CloudProject>? catalogs =
+                ExecuteWithRetriesAsync<PagedEnumerable<ProjectList, CloudProject>?>(func, activity).GetAwaiter().GetResult();
+
+            List<string> projectIds = new List<string>();
+            if (catalogs != null)
+            {
+                projectIds = catalogs.Select(x => x.ProjectId).ToList();
+            }
+
+            if (this.IncludePublicProjectIds && !projectIds.Contains(BigQueryConstants.PublicProjectId))
+                projectIds.Add(BigQueryConstants.PublicProjectId);
+
+            projectIds.Sort();
+
+            List<string> matching = new List<string>();
+            foreach (string projectId in projectIds)
+            {
+                if (Regex.IsMatch(projectId, catalogRegexp, RegexOptions.IgnoreCase))
+                {
+                    matching.Add(projectId);
+                }
+            }
+
+            return matching;
+        }
+
+        /// <summary>
         /// Renews the internal BigQueryClient with updated credentials.
         /// </summary>
         internal void UpdateClientToken()
         {
-            // there isn't a way to set the credentials, just need to open a new client
-            Client = Open();
+            RefreshClient();
+        }
+
+        /// <summary>
+        /// Lightweight client refresh — reuses already-parsed settings, only refreshes credentials.
+        /// </summary>
+        private void RefreshClient()
+        {
+            this.TraceActivity(activity =>
+            {
+                SetCredential();
+
+                string? projectId = Client?.ProjectId;
+                if (string.IsNullOrEmpty(projectId) || projectId == BigQueryConstants.DetectProjectId)
+                    this.properties.TryGetValue(BigQueryParameters.ProjectId, out projectId);
+
+                string? billingProjectId = null;
+                this.properties.TryGetValue(BigQueryParameters.BillingProjectId, out billingProjectId);
+
+                BigQueryClientBuilder builder = new BigQueryClientBuilder()
+                {
+                    QuotaProject = billingProjectId,
+                    GoogleCredential = Credential,
+                    ProjectId = !string.IsNullOrEmpty(billingProjectId) ? billingProjectId : projectId
+                };
+
+                if (!string.IsNullOrEmpty(DefaultClientLocation))
+                    builder.DefaultLocation = DefaultClientLocation;
+
+                BigQueryClient client = builder.Build();
+
+                if (ClientTimeout.HasValue)
+                    client.Service.HttpClient.Timeout = ClientTimeout.Value;
+
+                var oldClient = Client;
+                Client = client;
+                oldClient?.Dispose();
+            }, ClassName + "." + nameof(RefreshClient));
         }
 
         /// <summary>
@@ -695,7 +808,14 @@ namespace AdbcDrivers.BigQuery
         /// </summary>
         public bool TokenRequiresUpdate(Exception ex) => BigQueryUtils.TokenRequiresUpdate(ex);
 
-        private async Task<T> ExecuteWithRetriesAsync<T>(Func<Task<T>> action, Activity? activity) => await RetryManager.ExecuteWithRetriesAsync<T>(this, action, activity, MaxRetryAttempts, RetryDelayMs);
+        internal void PersistProperty(string key, string value)
+        {
+            this.properties[key] = value;
+        }
+
+        internal int RetryTotalTimeoutMs { get; private set; } = 0;
+
+        private async Task<T> ExecuteWithRetriesAsync<T>(Func<Task<T>> action, Activity? activity) => await RetryManager.ExecuteWithRetriesAsync<T>(this, action, activity, MaxRetryAttempts, RetryDelayMs, RetryTotalTimeoutMs);
 
         /// <summary>
         /// Executes the query using the BigQueryClient.
@@ -737,6 +857,35 @@ namespace AdbcDrivers.BigQuery
             }, ClassName + "." + nameof(ExecuteQuery));
         }
 
+        private async Task<BigQueryResults?> ExecuteQueryAsync(string sql, IEnumerable<BigQueryParameter>? parameters, QueryOptions? queryOptions = null, GetQueryResultsOptions? resultsOptions = null)
+        {
+            if (Client == null) { Client = Open(); }
+
+            return await this.TraceActivityAsync(async activity =>
+            {
+                try
+                {
+                    activity?.AddConditionalTag(SemanticConventions.Db.Query.Text, sql, IsSafeToTrace);
+                    Task<BigQueryResults> func()
+                    {
+                        return this.TraceActivityAsync(async (activity) =>
+                        {
+                            BigQueryJob job = await Client.CreateQueryJobAsync(sql, parameters ?? Enumerable.Empty<BigQueryParameter>(), queryOptions);
+                            activity?.AddBigQueryTag("job_id", job.Reference.JobId);
+                            return await job.GetQueryResultsAsync(resultsOptions);
+                        }, ClassName + "." + nameof(ExecuteQueryAsync) + "." + nameof(BigQueryJob.GetQueryResultsAsync));
+                    }
+                    BigQueryResults? result = await ExecuteWithRetriesAsync(func, activity);
+
+                    return result;
+                }
+                catch (Exception ex) when (IsUnauthorizedException(ex, out GoogleApiException? googleEx))
+                {
+                    throw new AdbcException(googleEx!.Message, AdbcStatusCode.Unauthorized, ex);
+                }
+            }, ClassName + "." + nameof(ExecuteQueryAsync));
+        }
+
         internal static bool IsUnauthorizedException(Exception ex, out GoogleApiException? googleEx)
         {
             return BigQueryUtils.ContainsException(ex, out googleEx) && googleEx!.Error.Code == (int)System.Net.HttpStatusCode.Unauthorized;
@@ -750,7 +899,19 @@ namespace AdbcDrivers.BigQuery
             IReadOnlyList<string>? tableTypes,
             string? columnNamePattern)
         {
-            return this.TraceActivity(activity =>
+            return GetCatalogsAsync(depth, catalogPattern, dbSchemaPattern,
+                tableNamePattern, tableTypes, columnNamePattern).GetAwaiter().GetResult();
+        }
+
+        private async Task<IArrowArray[]> GetCatalogsAsync(
+            GetObjectsDepth depth,
+            string? catalogPattern,
+            string? dbSchemaPattern,
+            string? tableNamePattern,
+            IReadOnlyList<string>? tableTypes,
+            string? columnNamePattern)
+        {
+            return await this.TraceActivityAsync(async activity =>
             {
                 StringArray.Builder catalogNameBuilder = new StringArray.Builder();
                 List<IArrowArray?> catalogDbSchemasValues = new List<IArrowArray?>();
@@ -764,7 +925,7 @@ namespace AdbcDrivers.BigQuery
                     return Client?.ListProjects();
                 });
 
-                catalogs = ExecuteWithRetriesAsync<PagedEnumerable<ProjectList, CloudProject>?>(func, activity).GetAwaiter().GetResult();
+                catalogs = await ExecuteWithRetriesAsync<PagedEnumerable<ProjectList, CloudProject>?>(func, activity);
 
                 if (catalogs != null)
                 {
@@ -776,22 +937,37 @@ namespace AdbcDrivers.BigQuery
 
                 projectIds.Sort();
 
+                // Filter matching project IDs first
+                List<string> matchingProjectIds = new List<string>();
                 foreach (string projectId in projectIds)
                 {
                     if (Regex.IsMatch(projectId, catalogRegexp, RegexOptions.IgnoreCase))
                     {
-                        catalogNameBuilder.Append(projectId);
+                        matchingProjectIds.Add(projectId);
+                    }
+                }
 
-                        if (depth == GetObjectsDepth.Catalogs)
-                        {
-                            catalogDbSchemasValues.Add(null);
-                        }
-                        else
-                        {
-                            catalogDbSchemasValues.Add(GetDbSchemas(
-                                depth, projectId, dbSchemaPattern,
-                                tableNamePattern, tableTypes, columnNamePattern));
-                        }
+                if (depth == GetObjectsDepth.Catalogs)
+                {
+                    foreach (string projectId in matchingProjectIds)
+                    {
+                        catalogNameBuilder.Append(projectId);
+                        catalogDbSchemasValues.Add(null);
+                    }
+                }
+                else
+                {
+                    // Use Task.WhenAll for parallel async execution instead of Parallel.ForEach
+                    var tasks = matchingProjectIds.Select(projectId =>
+                        GetDbSchemasAsync(depth, projectId, dbSchemaPattern,
+                            tableNamePattern, tableTypes, columnNamePattern)).ToList();
+
+                    StructArray[] results = await Task.WhenAll(tasks);
+
+                    for (int i = 0; i < matchingProjectIds.Count; i++)
+                    {
+                        catalogNameBuilder.Append(matchingProjectIds[i]);
+                        catalogDbSchemasValues.Add(results[i]);
                     }
                 }
 
@@ -804,10 +980,10 @@ namespace AdbcDrivers.BigQuery
                 StandardSchemas.GetObjectsSchema.Validate(dataArrays);
 
                 return dataArrays;
-            }, ClassName + "." + nameof(GetCatalogs));
+            }, ClassName + "." + nameof(GetCatalogsAsync));
         }
 
-        private StructArray GetDbSchemas(
+        internal async Task<StructArray> GetDbSchemasAsync(
             GetObjectsDepth depth,
             string catalog,
             string? dbSchemaPattern,
@@ -815,7 +991,7 @@ namespace AdbcDrivers.BigQuery
             IReadOnlyList<string>? tableTypes,
             string? columnNamePattern)
         {
-            return this.TraceActivity(activity =>
+            return await this.TraceActivityAsync(async activity =>
             {
                 StringArray.Builder dbSchemaNameBuilder = new StringArray.Builder();
                 List<IArrowArray?> dbSchemaTablesValues = new List<IArrowArray?>();
@@ -830,7 +1006,7 @@ namespace AdbcDrivers.BigQuery
                     return Client?.ListDatasets(catalog);
                 });
 
-                PagedEnumerable<DatasetList, BigQueryDataset>? schemas = ExecuteWithRetriesAsync<PagedEnumerable<DatasetList, BigQueryDataset>?>(func, activity).GetAwaiter().GetResult();
+                PagedEnumerable<DatasetList, BigQueryDataset>? schemas = await ExecuteWithRetriesAsync<PagedEnumerable<DatasetList, BigQueryDataset>?>(func, activity);
 
                 if (schemas != null)
                 {
@@ -848,7 +1024,7 @@ namespace AdbcDrivers.BigQuery
                             }
                             else
                             {
-                                dbSchemaTablesValues.Add(GetTableSchemas(
+                                dbSchemaTablesValues.Add(await GetTableSchemasAsync(
                                     depth, catalog, schema.Reference.DatasetId,
                                     tableNamePattern, tableTypes, columnNamePattern));
                             }
@@ -868,10 +1044,77 @@ namespace AdbcDrivers.BigQuery
                     length,
                     dataArrays,
                     nullBitmapBuffer.Build());
-            }, ClassName + "." + nameof(GetDbSchemas));
+            }, ClassName + "." + nameof(GetDbSchemasAsync));
         }
 
-        private StructArray GetTableSchemas(
+        /// <summary>
+        /// Fetches all columns for a dataset in a single INFORMATION_SCHEMA query,
+        /// grouped by table_name. Avoids N+1 per-table queries.
+        /// </summary>
+        private async Task<Dictionary<string, List<BigQueryRow>>> BatchFetchColumnsAsync(
+            string catalog, string dbSchema, string? columnNamePattern)
+        {
+            string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.COLUMNS";
+            List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+
+            if (columnNamePattern != null)
+            {
+                query += " WHERE column_name LIKE @columnNamePattern";
+                queryParams.Add(new BigQueryParameter("columnNamePattern", BigQueryDbType.String, columnNamePattern));
+            }
+
+            query += " ORDER BY table_name, ordinal_position";
+
+            var grouped = new Dictionary<string, List<BigQueryRow>>(StringComparer.OrdinalIgnoreCase);
+            BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams.Count > 0 ? queryParams : null);
+
+            if (result != null)
+            {
+                foreach (BigQueryRow row in result)
+                {
+                    string tableName = GetValue(row["table_name"]);
+                    if (!grouped.TryGetValue(tableName, out var list))
+                    {
+                        list = new List<BigQueryRow>();
+                        grouped[tableName] = list;
+                    }
+                    list.Add(row);
+                }
+            }
+
+            return grouped;
+        }
+
+        /// <summary>
+        /// Fetches all table constraints for a dataset in a single INFORMATION_SCHEMA query,
+        /// grouped by table_name. Avoids N+1 per-table queries.
+        /// </summary>
+        private async Task<Dictionary<string, List<BigQueryRow>>> BatchFetchConstraintsAsync(
+            string catalog, string dbSchema)
+        {
+            string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS";
+
+            var grouped = new Dictionary<string, List<BigQueryRow>>(StringComparer.OrdinalIgnoreCase);
+            BigQueryResults? result = await ExecuteQueryAsync(query, parameters: null);
+
+            if (result != null)
+            {
+                foreach (BigQueryRow row in result)
+                {
+                    string tableName = GetValue(row["table_name"]);
+                    if (!grouped.TryGetValue(tableName, out var list))
+                    {
+                        list = new List<BigQueryRow>();
+                        grouped[tableName] = list;
+                    }
+                    list.Add(row);
+                }
+            }
+
+            return grouped;
+        }
+
+        private async Task<StructArray> GetTableSchemasAsync(
             GetObjectsDepth depth,
             string catalog,
             string dbSchema,
@@ -879,7 +1122,7 @@ namespace AdbcDrivers.BigQuery
             IReadOnlyList<string>? tableTypes,
             string? columnNamePattern)
         {
-            return this.TraceActivity(activity =>
+            return await this.TraceActivityAsync(async activity =>
             {
                 StringArray.Builder tableNameBuilder = new StringArray.Builder();
                 StringArray.Builder tableTypeBuilder = new StringArray.Builder();
@@ -888,28 +1131,35 @@ namespace AdbcDrivers.BigQuery
                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                 int length = 0;
 
-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.TABLES",
-                    Sanitize(catalog), Sanitize(dbSchema));
+                string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.TABLES";
+                List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
 
                 if (tableNamePattern != null)
                 {
-                    query = string.Concat(query, string.Format(" WHERE table_name LIKE '{0}'", Sanitize(tableNamePattern)));
+                    query += " WHERE table_name LIKE @tableNamePattern";
+                    queryParams.Add(new BigQueryParameter("tableNamePattern", BigQueryDbType.String, tableNamePattern));
                     if (tableTypes?.Count > 0)
                     {
-                        IEnumerable<string> sanitizedTypes = tableTypes.Select(x => Sanitize(x));
-                        query = string.Concat(query, string.Format(" AND table_type IN ('{0}')", string.Join("', '", sanitizedTypes).ToUpper()));
+                        List<string> upperTypes = tableTypes.Select(x => x.ToUpper()).ToList();
+                        string typePlaceholders = string.Join(", ", upperTypes.Select((_, idx) => $"@tableType{idx}"));
+                        query += $" AND UPPER(table_type) IN ({typePlaceholders})";
+                        for (int idx = 0; idx < upperTypes.Count; idx++)
+                            queryParams.Add(new BigQueryParameter($"tableType{idx}", BigQueryDbType.String, upperTypes[idx]));
                     }
                 }
                 else
                 {
                     if (tableTypes?.Count > 0)
                     {
-                        IEnumerable<string> sanitizedTypes = tableTypes.Select(x => Sanitize(x));
-                        query = string.Concat(query, string.Format(" WHERE table_type IN ('{0}')", string.Join("', '", sanitizedTypes).ToUpper()));
+                        List<string> upperTypes = tableTypes.Select(x => x.ToUpper()).ToList();
+                        string typePlaceholders = string.Join(", ", upperTypes.Select((_, idx) => $"@tableType{idx}"));
+                        query += $" WHERE UPPER(table_type) IN ({typePlaceholders})";
+                        for (int idx = 0; idx < upperTypes.Count; idx++)
+                            queryParams.Add(new BigQueryParameter($"tableType{idx}", BigQueryDbType.String, upperTypes[idx]));
                     }
                 }
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
+                BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams.Count > 0 ? queryParams : null);
 
                 if (result != null)
                 {
@@ -920,17 +1170,27 @@ namespace AdbcDrivers.BigQuery
                         bool.TryParse(includeConstraintsValue, out includeConstraints);
                     }
 
+                    // Pre-fetch all columns and constraints for the dataset in batch
+                    Dictionary<string, List<BigQueryRow>>? batchedColumns =
+                        (depth != GetObjectsDepth.Tables) ? await BatchFetchColumnsAsync(catalog, dbSchema, columnNamePattern) : null;
+                    Dictionary<string, List<BigQueryRow>>? batchedConstraints =
+                        (depth == GetObjectsDepth.All && includeConstraints) ? await BatchFetchConstraintsAsync(catalog, dbSchema) : null;
+
                     foreach (BigQueryRow row in result)
                     {
-                        tableNameBuilder.Append(GetValue(row["table_name"]));
+                        string tableName = GetValue(row["table_name"]);
+                        tableNameBuilder.Append(tableName);
                         tableTypeBuilder.Append(GetValue(row["table_type"]));
                         nullBitmapBuffer.Append(true);
                         length++;
 
                         if (depth == GetObjectsDepth.All && includeConstraints)
                         {
-                            tableConstraintsValues.Add(GetConstraintSchema(
-                                depth, catalog, dbSchema, GetValue(row["table_name"]), columnNamePattern));
+                            List<BigQueryRow>? prefetchedConstraintRows = null;
+                            batchedConstraints?.TryGetValue(tableName, out prefetchedConstraintRows);
+                            tableConstraintsValues.Add(await GetConstraintSchemaAsync(
+                                depth, catalog, dbSchema, tableName, columnNamePattern,
+                                prefetchedRows: prefetchedConstraintRows));
                         }
                         else
                         {
@@ -943,7 +1203,10 @@ namespace AdbcDrivers.BigQuery
                         }
                         else
                         {
-                            tableColumnsValues.Add(GetColumnSchema(catalog, dbSchema, GetValue(row["table_name"]), columnNamePattern));
+                            List<BigQueryRow>? prefetchedColumnRows = null;
+                            batchedColumns?.TryGetValue(tableName, out prefetchedColumnRows);
+                            tableColumnsValues.Add(await GetColumnSchemaAsync(catalog, dbSchema, tableName, columnNamePattern,
+                                prefetchedRows: prefetchedColumnRows));
                         }
                     }
                 }
@@ -962,16 +1225,17 @@ namespace AdbcDrivers.BigQuery
                     length,
                     dataArrays,
                     nullBitmapBuffer.Build());
-            }, ClassName + "." + nameof(GetTableSchemas));
+            }, ClassName + "." + nameof(GetTableSchemasAsync));
         }
 
-        private StructArray GetColumnSchema(
+        private async Task<StructArray> GetColumnSchemaAsync(
             string catalog,
             string dbSchema,
             string table,
-            string? columnNamePattern)
+            string? columnNamePattern,
+            List<BigQueryRow>? prefetchedRows = null)
         {
-            return this.TraceActivity(activity =>
+            return await this.TraceActivityAsync(async activity =>
             {
                 StringArray.Builder columnNameBuilder = new StringArray.Builder();
                 Int32Array.Builder ordinalPositionBuilder = new Int32Array.Builder();
@@ -995,19 +1259,32 @@ namespace AdbcDrivers.BigQuery
                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                 int length = 0;
 
-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = '{2}'",
-                    Sanitize(catalog), Sanitize(dbSchema), Sanitize(table));
+                IEnumerable<BigQueryRow>? rows = null;
 
-                if (columnNamePattern != null)
+                if (prefetchedRows != null)
                 {
-                    query = string.Concat(query, string.Format("AND column_name LIKE '{0}'", Sanitize(columnNamePattern)));
+                    // Use pre-fetched batch data — no SQL query needed
+                    rows = prefetchedRows;
+                }
+                else
+                {
+                    // Fallback: per-table query
+                    string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = @tableName";
+                    List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+                    queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
+
+                    if (columnNamePattern != null)
+                    {
+                        query += " AND column_name LIKE @columnNamePattern";
+                        queryParams.Add(new BigQueryParameter("columnNamePattern", BigQueryDbType.String, columnNamePattern));
+                    }
+
+                    rows = await ExecuteQueryAsync(query, parameters: queryParams);
                 }
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
-
-                if (result != null)
+                if (rows != null)
                 {
-                    foreach (BigQueryRow row in result)
+                    foreach (BigQueryRow row in rows)
                     {
                         columnNameBuilder.Append(GetValue(row["column_name"]));
                         ordinalPositionBuilder.Append((int)(long)row["ordinal_position"]);
@@ -1078,17 +1355,18 @@ namespace AdbcDrivers.BigQuery
                     length,
                     dataArrays,
                     nullBitmapBuffer.Build());
-            }, ClassName + "." + nameof(GetColumnSchema));
+            }, ClassName + "." + nameof(GetColumnSchemaAsync));
         }
 
-        private StructArray GetConstraintSchema(
+        private async Task<StructArray> GetConstraintSchemaAsync(
             GetObjectsDepth depth,
             string catalog,
             string dbSchema,
             string table,
-            string? columnNamePattern)
+            string? columnNamePattern,
+            List<BigQueryRow>? prefetchedRows = null)
         {
-            return this.TraceActivity(activity =>
+            return await this.TraceActivityAsync(async activity =>
             {
                 StringArray.Builder constraintNameBuilder = new StringArray.Builder();
                 StringArray.Builder constraintTypeBuilder = new StringArray.Builder();
@@ -1097,14 +1375,25 @@ namespace AdbcDrivers.BigQuery
                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                 int length = 0;
 
-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE table_name = '{2}'",
-                   Sanitize(catalog), Sanitize(dbSchema), Sanitize(table));
+                IEnumerable<BigQueryRow>? rows = null;
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
-
-                if (result != null)
+                if (prefetchedRows != null)
                 {
-                    foreach (BigQueryRow row in result)
+                    // Use pre-fetched batch data — no SQL query needed
+                    rows = prefetchedRows;
+                }
+                else
+                {
+                    // Fallback: per-table query
+                    string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE table_name = @tableName";
+                    List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+                    queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
+                    rows = await ExecuteQueryAsync(query, parameters: queryParams);
+                }
+
+                if (rows != null)
+                {
+                    foreach (BigQueryRow row in rows)
                     {
                         string constraintName = GetValue(row["constraint_name"]);
                         constraintNameBuilder.Append(constraintName);
@@ -1115,11 +1404,11 @@ namespace AdbcDrivers.BigQuery
 
                         if (depth == GetObjectsDepth.All || depth == GetObjectsDepth.Tables)
                         {
-                            constraintColumnNamesValues.Add(GetConstraintColumnNames(
+                            constraintColumnNamesValues.Add(await GetConstraintColumnNamesAsync(
                                 catalog, dbSchema, table, constraintName));
                             if (constraintType.ToUpper() == "FOREIGN KEY")
                             {
-                                constraintColumnUsageValues.Add(GetConstraintsUsage(
+                                constraintColumnUsageValues.Add(await GetConstraintsUsageAsync(
                                     catalog, dbSchema, table, constraintName));
                             }
                             else
@@ -1150,23 +1439,25 @@ namespace AdbcDrivers.BigQuery
                     length,
                     dataArrays,
                     nullBitmapBuffer.Build());
-            }, ClassName + "." + nameof(GetConstraintSchema));
+            }, ClassName + "." + nameof(GetConstraintSchemaAsync));
         }
 
-        private StringArray GetConstraintColumnNames(
+        private async Task<StringArray> GetConstraintColumnNamesAsync(
             string catalog,
             string dbSchema,
             string table,
             string constraintName)
         {
-            return this.TraceActivity(activity =>
+            return await this.TraceActivityAsync(async activity =>
             {
-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.KEY_COLUMN_USAGE WHERE table_name = '{2}' AND constraint_name = '{3}' ORDER BY ordinal_position",
-               Sanitize(catalog), Sanitize(dbSchema), Sanitize(table), Sanitize(constraintName));
+                string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.KEY_COLUMN_USAGE WHERE table_name = @tableName AND constraint_name = @constraintName ORDER BY ordinal_position";
+                List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+                queryParams.Add(new BigQueryParameter("tableName", BigQueryDbType.String, table));
+                queryParams.Add(new BigQueryParameter("constraintName", BigQueryDbType.String, constraintName));
 
                 StringArray.Builder constraintColumnNamesBuilder = new StringArray.Builder();
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
+                BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams);
 
                 if (result != null)
                 {
@@ -1178,16 +1469,16 @@ namespace AdbcDrivers.BigQuery
                 }
 
                 return constraintColumnNamesBuilder.Build();
-            }, ClassName + "." + nameof(GetConstraintColumnNames));
+            }, ClassName + "." + nameof(GetConstraintColumnNamesAsync));
         }
 
-        private StructArray GetConstraintsUsage(
+        private async Task<StructArray> GetConstraintsUsageAsync(
             string catalog,
             string dbSchema,
             string table,
             string constraintName)
         {
-            return this.TraceActivity(activity =>
+            return await this.TraceActivityAsync(async activity =>
             {
                 StringArray.Builder constraintFkCatalogBuilder = new StringArray.Builder();
                 StringArray.Builder constraintFkDbSchemaBuilder = new StringArray.Builder();
@@ -1196,10 +1487,11 @@ namespace AdbcDrivers.BigQuery
                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                 int length = 0;
 
-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE WHERE constraint_name = '{2}'",
-                   Sanitize(catalog), Sanitize(dbSchema), Sanitize(constraintName));
+                string query = $"SELECT * FROM `{Sanitize(catalog)}`.`{Sanitize(dbSchema)}`.INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE WHERE constraint_name = @constraintName";
+                List<BigQueryParameter> queryParams = new List<BigQueryParameter>();
+                queryParams.Add(new BigQueryParameter("constraintName", BigQueryDbType.String, constraintName));
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
+                BigQueryResults? result = await ExecuteQueryAsync(query, parameters: queryParams);
 
                 if (result != null)
                 {
@@ -1234,7 +1526,7 @@ namespace AdbcDrivers.BigQuery
                     length,
                     dataArrays,
                     nullBitmapBuffer.Build());
-            }, ClassName + "." + nameof(GetConstraintsUsage));
+            }, ClassName + "." + nameof(GetConstraintsUsageAsync));
         }
 
         private string PatternToRegEx(string? pattern)
@@ -1242,8 +1534,13 @@ namespace AdbcDrivers.BigQuery
             if (pattern == null)
                 return ".*";
 
+            // Escape regex metacharacters first (e.g. . * + ? become \. \* \+ \?),
+            // then convert SQL LIKE wildcards to regex equivalents.
+            // Regex.Escape does NOT escape _ or % (they aren't regex metacharacters),
+            // so we replace them directly after escaping everything else.
+            string escaped = Regex.Escape(pattern);
             StringBuilder builder = new StringBuilder("(?i)^");
-            string convertedPattern = pattern.Replace("_", ".").Replace("%", ".*");
+            string convertedPattern = escaped.Replace("_", ".").Replace("%", ".*");
             builder.Append(convertedPattern);
             builder.Append("$");
 
@@ -1534,11 +1831,16 @@ namespace AdbcDrivers.BigQuery
         {
             Client?.Dispose();
             Client = null;
+            // The ReadClientManager wraps a BigQueryReadClient (gRPC channel).
+            // We null the reference so it can be garbage-collected; the underlying
+            // gRPC channel will be cleaned up by the finalizer since
+            // BigQueryReadClient does not expose a public Dispose().
+            ReadClientManager = null;
             this.httpClient?.Dispose();
             this._fileActivityListener?.Dispose();
         }
 
-        private static Regex sanitizedInputRegex = new Regex("^[a-zA-Z0-9_-]+");
+        private static Regex sanitizedInputRegex = new Regex("^[a-zA-Z0-9_-]+$");
 
         private string Sanitize(string? input)
         {
@@ -1573,12 +1875,12 @@ namespace AdbcDrivers.BigQuery
                 clientSecret,
                 Uri.EscapeDataString(refreshToken));
 
-            HttpClient httpClient = new HttpClient();
-
             HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, tokenEndpoint);
             request.Headers.Add("Accept", "application/json");
             request.Content = new StringContent(body, Encoding.UTF8, "application/x-www-form-urlencoded");
-            HttpResponseMessage response = httpClient.SendAsync(request).GetAwaiter().GetResult();
+
+            // Reuse the class-level httpClient instead of creating a new one each call
+            HttpResponseMessage response = this.httpClient.SendAsync(request).GetAwaiter().GetResult();
             string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
 
             BigQueryTokenResponse? bigQueryTokenResponse = JsonSerializer.Deserialize<BigQueryTokenResponse>(responseBody);

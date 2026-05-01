@@ -33,7 +33,9 @@ namespace AdbcDrivers.BigQuery
     /// </summary>
     internal class TokenProtectedReadClientManger : ITokenProtectedResource
     {
-        BigQueryReadClient bigQueryReadClient;
+        private volatile BigQueryReadClient bigQueryReadClient;
+        private readonly object _rebuildLock = new object();
+        private GoogleCredential? _lastCredential;
 
         public TokenProtectedReadClientManger(GoogleCredential credential)
         {
@@ -54,9 +56,16 @@ namespace AdbcDrivers.BigQuery
                 throw new ArgumentNullException(nameof(credential));
             }
 
-            BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder();
-            readClientBuilder.Credential = credential;
-            this.bigQueryReadClient = readClientBuilder.Build();
+            lock (_rebuildLock)
+            {
+                if (ReferenceEquals(credential, _lastCredential) && bigQueryReadClient != null)
+                    return;
+
+                BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder();
+                readClientBuilder.Credential = credential;
+                this.bigQueryReadClient = readClientBuilder.Build();
+                _lastCredential = credential;
+            }
         }
 
         public Func<Task>? UpdateToken { get; set; }
